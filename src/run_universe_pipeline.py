@@ -1,8 +1,8 @@
 """
-Run Pipeline
+Weekly Universe Pipeline – Gilt Compass
 
-Single entry point for The Gilt Compass.
-Runs the full deterministic pipeline and emits a run manifest.
+Discovers and manages instrument lifecycle.
+Run weekly.
 """
 
 import subprocess
@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 
 from src.manifest import write_manifest
-
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -25,12 +24,11 @@ def run(module: str) -> None:
 
 def main() -> None:
     steps = [
-        "src.ingest_prices",
-        "src.score",
-        "src.agents.librarian",
-        "src.agents.thesis",
-        "src.agents.auditor",
-        "src.agents.patrician",
+        "src.ingest_universe_trading212",
+        "src.universe.diff_trading212_universe",
+        "src.universe.enqueue_new_trading212",
+        "src.universe.mark_inactive_trading212",
+        "src.universe.tag_price_source",  # safety net
     ]
 
     try:
@@ -38,12 +36,12 @@ def main() -> None:
             run(step)
 
         manifest = write_manifest(steps=steps, status="SUCCESS")
-        print(f"\n✓ Pipeline completed successfully")
+        print("\n✓ Universe pipeline completed")
         print(f"✓ Manifest written: {manifest}")
 
-    except Exception as e:
+    except Exception:
         manifest = write_manifest(steps=steps, status="FAILED")
-        print(f"\n✗ Pipeline failed")
+        print("\n✗ Universe pipeline failed")
         print(f"✗ Manifest written: {manifest}")
         raise
 
