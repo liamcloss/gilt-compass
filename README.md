@@ -223,27 +223,3 @@ If these look sane, the system is healthy.
 Gilt Compass is designed to respect all three.
 
 ---
-
-## Next extensions (optional, not required)
-
-- Thesis cooldowns / expiry
-- Rank‑crossing triggers (top‑N)
-- Score confidence bands
-- Manual approve/reject loop
-- Secondary price providers
-
-None of these are required for correctness.
-
----
-
-## Final note
-
-If something feels “quiet”, that’s a feature.
-
-Silence means:
-- no new instruments
-- no new prices
-- no meaningful changes
-
-That’s exactly when you should do nothing.
-
