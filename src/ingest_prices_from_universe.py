@@ -1,247 +1,388 @@
-"""
-Price Ingest from Universe (Incremental, Tolerant) – v1
-
-Key properties:
-- Reads Gilt Compass universe
-- Only attempts Yahoo-priceable instruments
-- Never retries known failures
-- Never re-downloads existing prices
-- O(Δ) per run, not O(N)
-
-State files:
-- prices_1y.parquet           → successful prices
-- price_ingest_failures.csv   → permanent Yahoo failures
-- price_ingest_attempted.csv  → all attempted instrument_ids
-"""
+from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timedelta, UTC
+from typing import Dict
+import time
+import gc
+import csv
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
-import time
+from filelock import FileLock, Timeout
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Paths
-# ---------------------------------------------------------------------
+# =====================================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 UNIVERSE = BASE_DIR / "data" / "universe" / "gilt_universe.csv"
 
 OUT_DIR = BASE_DIR / "data" / "prices"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PRICES_OUT = OUT_DIR / "prices_1y.parquet"
-FAILED_OUT = OUT_DIR / "price_ingest_failures.csv"
-ATTEMPTED_OUT = OUT_DIR / "price_ingest_attempted.csv"
+FAILURES_OUT = OUT_DIR / "price_ingest_failures.csv"
+LOCK_FILE = OUT_DIR / ".price_ingest.lock"
 
 
-# ---------------------------------------------------------------------
-# Yahoo eligibility (authoritative)
-# ---------------------------------------------------------------------
+# =====================================================================
+# Config
+# =====================================================================
 
-def is_yahoo_eligible(symbol: str) -> bool:
-    if not symbol:
-        return False
+DEBUG_MODE = False
+DEBUG_MAX_INSTRUMENTS = 100
 
-    # Numeric / synthetic
-    if symbol[0].isdigit():
-        return False
+DAILY_BACKFILL_DAYS = 10
+MAX_LOOKBACK_DAYS = 365
+CHECKPOINT_EVERY = 25
 
-    # Must contain letters
-    if not any(c.isalpha() for c in symbol):
-        return False
+MAX_WORKERS = 4
+REQUEST_SLEEP_SECONDS = 0.35
+LOCK_TIMEOUT_SECONDS = 5
 
-    # SPAC units, rights, warrants, notes
-    if len(symbol) >= 5 and symbol.endswith(("D", "R", "U", "W")):
-        return False
-
-    # ETN / synthetic pattern (no vowels)
-    if not any(v in symbol.upper() for v in "AEIOU"):
-        return False
-
-    return True
+NO_DATA_EXCLUSION_THRESHOLD = 3
+NO_DATA_PATTERNS = [
+    "no data",
+    "possibly delisted",
+    "no timezone",
+    "no objects to concatenate",
+]
 
 
-# ---------------------------------------------------------------------
-# Yahoo ticker mapping (tolerant)
-# ---------------------------------------------------------------------
+# =====================================================================
+# Failure telemetry (learning exclusions)
+# =====================================================================
 
-def map_to_yahoo(symbol: str, market: str | None) -> list[str]:
-    candidates = []
-
-    if market == "US":
-        candidates.append(symbol)
-    elif market == "GB":
-        candidates.append(f"{symbol}.L")
-    elif market == "DE":
-        candidates.append(f"{symbol}.DE")
-    elif market == "FR":
-        candidates.append(f"{symbol}.PA")
-    elif market == "NL":
-        candidates.append(f"{symbol}.AS")
-
-    # Fallback
-    candidates.append(symbol)
-
-    # Deduplicate while preserving order
-    return list(dict.fromkeys(candidates))
+FAILURE_COLUMNS = [
+    "instrument_id",
+    "symbol",
+    "market",
+    "last_attempt",
+    "attempt_count",
+    "last_error",
+]
 
 
-# ---------------------------------------------------------------------
-# Fetch prices
-# ---------------------------------------------------------------------
+def load_failures() -> pd.DataFrame:
+    if not FAILURES_OUT.exists():
+        return pd.DataFrame(columns=FAILURE_COLUMNS)
 
-def fetch_prices(yahoo_ticker: str, start: str, end: str) -> pd.DataFrame | None:
-    try:
-        df = yf.download(
-            yahoo_ticker,
-            start=start,
-            end=end,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
+    df = pd.read_csv(
+        str(FAILURES_OUT),
+        parse_dates=["last_attempt"],
+        engine="python",
+        on_bad_lines="skip",
+    )
 
-        if df.empty:
-            return None
+    for col in FAILURE_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA
 
-        df = df.reset_index()
-        df["yahoo_ticker"] = yahoo_ticker
-        return df
-
-    except Exception:
-        return None
+    return df[FAILURE_COLUMNS]
 
 
-# ---------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------
+def record_no_data_failure(
+    instrument_id: str,
+    symbol: str,
+    market: str,
+    error: str,
+) -> None:
+    df = load_failures()
+    existing = df[df["instrument_id"] == instrument_id]
 
-def run() -> None:
-    universe = pd.read_csv(UNIVERSE)
+    attempt = int(existing["attempt_count"].iloc[0]) + 1 if not existing.empty else 1
+    df = df[df["instrument_id"] != instrument_id]
 
-    # -----------------------------------------------------------------
-    # Load state
-    # -----------------------------------------------------------------
-
-    attempted = set()
-    if ATTEMPTED_OUT.exists():
-        attempted = set(pd.read_csv(ATTEMPTED_OUT)["instrument_id"])
-
-    failures_df = pd.read_csv(FAILED_OUT) if FAILED_OUT.exists() else pd.DataFrame()
-    failed = set(failures_df["instrument_id"]) if not failures_df.empty else set()
-
-    existing_prices = set()
-    if PRICES_OUT.exists():
-        existing_prices = set(
-            pd.read_parquet(PRICES_OUT)["instrument_id"].unique()
-        )
-
-    # -----------------------------------------------------------------
-    # Candidate selection (THIS IS THE KEY FIX)
-    # -----------------------------------------------------------------
-
-    candidates = universe[
-        (universe["active"] == True)
-        & (universe["price_eligible"] == True)
-        & (~universe["instrument_id"].isin(attempted))
-        & (~universe["instrument_id"].isin(existing_prices))
-        & (~universe["instrument_id"].isin(failed))
-    ]
-
-    print(f"▶ Attempting prices for {len(candidates):,} new instruments")
-
-    if candidates.empty:
-        print("✓ No new priceable instruments to ingest")
-        return
-
-    end = datetime.today()
-    start = end - timedelta(days=365)
-
-    all_prices = []
-    new_failures = []
-
-    # -----------------------------------------------------------------
-    # Ingest loop
-    # -----------------------------------------------------------------
-
-    for _, row in candidates.iterrows():
-        instrument_id = row["instrument_id"]
-        symbol = row["symbol"]
-        market = row["market"]
-
-        tried = []
-        success = False
-
-        for yahoo_ticker in map_to_yahoo(symbol, market):
-            tried.append(yahoo_ticker)
-
-            df = fetch_prices(
-                yahoo_ticker,
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-            )
-
-            if df is not None:
-                df["instrument_id"] = instrument_id
-                df["symbol"] = symbol
-                df["market"] = market
-                all_prices.append(df)
-                success = True
-                break
-
-            time.sleep(0.5)
-
-        attempted.add(instrument_id)
-
-        if not success:
-            new_failures.append({
+    df = pd.concat(
+        [
+            df,
+            pd.DataFrame([{
                 "instrument_id": instrument_id,
                 "symbol": symbol,
                 "market": market,
-                "tried": ";".join(tried),
-            })
+                "last_attempt": datetime.now(UTC),
+                "attempt_count": attempt,
+                "last_error": error,
+            }]),
+        ],
+        ignore_index=True,
+    )
 
-    # -----------------------------------------------------------------
-    # Persist results
-    # -----------------------------------------------------------------
+    df.to_csv(str(FAILURES_OUT), index=False, quoting=csv.QUOTE_ALL)
 
-    if all_prices:
-        prices = pd.concat(all_prices, ignore_index=True)
-        prices = prices.rename(columns={
-            "Date": "date",
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Adj Close": "adj_close",
-            "Volume": "volume",
-        })
 
-        if PRICES_OUT.exists():
-            prices = pd.concat(
-                [pd.read_parquet(PRICES_OUT), prices],
-                ignore_index=True,
+def load_excluded_instruments() -> set[str]:
+    if not FAILURES_OUT.exists():
+        return set()
+
+    df = load_failures()
+
+    mask = (
+        df["last_error"]
+        .astype(str)
+        .str.lower()
+        .apply(lambda x: any(p in x for p in NO_DATA_PATTERNS))
+        & (df["attempt_count"] >= NO_DATA_EXCLUSION_THRESHOLD)
+    )
+
+    return set(df.loc[mask, "instrument_id"])
+
+
+# =====================================================================
+# Incremental state
+# =====================================================================
+
+def load_last_price_dates() -> Dict[str, pd.Timestamp]:
+    if not PRICES_OUT.exists():
+        return {}
+
+    prices = pd.read_parquet(str(PRICES_OUT), columns=["instrument_id", "date"])
+    prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce")
+
+    raw = prices.groupby("instrument_id")["date"].max().to_dict()
+    return {
+        str(k): pd.Timestamp(v)
+        for k, v in raw.items()
+        if pd.notna(v)
+    }
+
+
+# =====================================================================
+# Schema helpers
+# =====================================================================
+
+def ensure_series(df: pd.DataFrame, col: str) -> pd.Series:
+    s = df[col]
+    return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
+
+
+def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[:, ~df.columns.duplicated()].copy() if not df.columns.is_unique else df
+
+
+def normalise_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ["Open", "High", "Low"]:
+        df[col] = ensure_series(df, col) if col in df.columns else df["Close"]
+
+    df["Adj Close"] = ensure_series(df, "Adj Close") if "Adj Close" in df.columns else df["Close"]
+    df["Volume"] = ensure_series(df, "Volume") if "Volume" in df.columns else None
+    return df
+
+
+def build_price_frame(
+    df: pd.DataFrame,
+    instrument_id: str,
+    symbol: str,
+    market: str,
+) -> pd.DataFrame:
+    df = df.rename(columns={
+        "Date": "date",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adj_close",
+        "Volume": "volume",
+    })
+
+    df["instrument_id"] = instrument_id
+    df["symbol"] = symbol
+    df["market"] = market
+    df["price_source"] = "yahoo"
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    return df[
+        [
+            "instrument_id",
+            "symbol",
+            "market",
+            "price_source",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "adj_close",
+            "volume",
+        ]
+    ]
+
+
+# =====================================================================
+# Yahoo fetch
+# =====================================================================
+
+def fetch_prices_yahoo(
+    ticker: str,
+    instrument_id: str,
+    symbol: str,
+    market: str,
+    start: str,
+    end: str,
+) -> pd.DataFrame | None:
+    try:
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            progress=False,
+            threads=False,
+        )
+    except (ValueError, KeyError, TypeError):
+        return None
+
+    if df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df = normalise_columns(df.reset_index())
+
+    if "Date" not in df.columns or "Close" not in df.columns:
+        return None
+
+    df = normalise_ohlcv(df)
+    return build_price_frame(df, instrument_id, symbol, market)
+
+
+# =====================================================================
+# Async wrapper
+# =====================================================================
+
+async def fetch_async(loop, executor, payload):
+    await asyncio.sleep(REQUEST_SLEEP_SECONDS)
+    result = await loop.run_in_executor(executor, fetch_prices_yahoo, *payload)
+    return payload, result
+
+
+# =====================================================================
+# Checkpoint
+# =====================================================================
+
+def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
+    valid = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty]
+    frames.clear()
+
+    if not valid:
+        return
+
+    prices = pd.concat(valid, ignore_index=True)
+    prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce")
+    prices = prices.dropna(subset=["instrument_id", "date"])
+
+    prices["volume"] = (
+        pd.to_numeric(prices["volume"], errors="coerce")
+        .round()
+        .astype("Int64")
+    )
+
+    if PRICES_OUT.exists():
+        existing = pd.read_parquet(str(PRICES_OUT))
+        existing["date"] = pd.to_datetime(existing["date"], utc=True, errors="coerce")
+        prices = pd.concat([existing, prices], ignore_index=True)
+
+    prices = prices.drop_duplicates(["instrument_id", "date"], keep="last")
+    prices.to_parquet(str(PRICES_OUT), index=False)
+
+    print(f"✓ Prices written ({len(prices):,} rows total)")
+    gc.collect()
+
+
+# =====================================================================
+# Main
+# =====================================================================
+
+async def run_async():
+    universe = pd.read_csv(str(UNIVERSE))
+    last_dates = load_last_price_dates()
+    excluded = load_excluded_instruments()
+
+    candidates = (
+        universe[
+            (universe["active"] == True)
+            & (universe["price_eligible"] == True)
+            & (~universe["instrument_id"].isin(excluded))
+        ]
+        .sort_values("instrument_id")
+        .drop_duplicates("instrument_id")
+    )
+
+    if DEBUG_MODE:
+        candidates = candidates.head(DEBUG_MAX_INSTRUMENTS)
+        print(f"⚠ DEBUG MODE: limiting to {len(candidates)} instruments")
+
+    end = datetime.now(UTC)
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+    tasks = []
+    for _, r in candidates.iterrows():
+        last_dt = last_dates.get(r["instrument_id"])
+        start_dt = (
+            last_dt - timedelta(days=DAILY_BACKFILL_DAYS)
+            if last_dt is not None
+            else end - timedelta(days=MAX_LOOKBACK_DAYS)
+        )
+
+        payload = (
+            f"{r['symbol']}.L" if r["market"] == "GB" else r["symbol"],
+            r["instrument_id"],
+            r["symbol"],
+            r["market"],
+            start_dt.strftime("%Y-%m-%d"),
+            end.strftime("%Y-%m-%d"),
+        )
+
+        tasks.append(fetch_async(loop, executor, payload))
+
+    ok = no_data = 0
+    frames: list[pd.DataFrame] = []
+    start_time = time.time()
+
+    for idx, coro in enumerate(asyncio.as_completed(tasks), 1):
+        payload, result = await coro
+        _, instrument_id, symbol, market, *_ = payload
+
+        if isinstance(result, pd.DataFrame):
+            frames.append(result)
+            ok += 1
+        else:
+            no_data += 1
+            record_no_data_failure(
+                instrument_id,
+                symbol,
+                market,
+                "no usable yahoo price data",
             )
 
-        prices.to_parquet(PRICES_OUT, index=False)
-        print(f"✓ Prices written → {PRICES_OUT}")
+        if idx % CHECKPOINT_EVERY == 0:
+            checkpoint_prices(frames)
 
-    if new_failures:
-        failures_df = pd.concat(
-            [failures_df, pd.DataFrame(new_failures)],
-            ignore_index=True,
-        )
-        failures_df.to_csv(FAILED_OUT, index=False)
-        print(f"⚠ New failures written → {FAILED_OUT}")
+        elapsed = time.time() - start_time
+        eta = int((elapsed / idx) * (len(tasks) - idx))
+        print(f"[{idx}/{len(tasks)}] ok={ok} no_data={no_data} ETA≈{eta}s")
 
-    pd.DataFrame(
-        sorted(attempted), columns=["instrument_id"]
-    ).to_csv(ATTEMPTED_OUT, index=False)
+    checkpoint_prices(frames)
+    executor.shutdown(wait=True)
 
-    print("\n✓ Incremental price ingest complete")
+    print(
+        f"\n✓ Run complete | tasks={len(tasks)} | "
+        f"ok={ok} | no_data={no_data} | "
+        f"elapsed={int(time.time() - start_time)}s"
+    )
+
+
+def run():
+    try:
+        with FileLock(str(LOCK_FILE), timeout=LOCK_TIMEOUT_SECONDS):
+            asyncio.run(run_async())
+    except Timeout:
+        print("⚠ Another ingest already running")
 
 
 if __name__ == "__main__":

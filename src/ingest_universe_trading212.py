@@ -42,15 +42,15 @@ ISA_OUT = ISA_DIR / f"trading212_isa_{TODAY}.parquet"
 
 BASE_URL = "https://live.trading212.com/api/v0"
 
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+T212_API_KEY = os.getenv("T212_API_KEY")
+T212_API_SECRET = os.getenv("T212_API_SECRET")
 
-if not API_KEY or not API_SECRET:
+if not T212_API_KEY or not T212_API_SECRET:
     raise RuntimeError(
-        "API_KEY and API_SECRET must be set as env vars"
+        "T212_API_KEY and T212_API_SECRET must be set as env vars"
     )
 
-auth = base64.b64encode(f"{API_KEY}:{API_SECRET}".encode()).decode()
+auth = base64.b64encode(f"{T212_API_KEY}:{T212_API_SECRET}".encode()).decode()
 HEADERS = {
     "Authorization": f"Basic {auth}",
     "Accept": "application/json",
