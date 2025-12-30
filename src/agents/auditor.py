@@ -1,91 +1,141 @@
 """
-Auditor Agent (v0)
+Auditor Agent (v1 — realigned)
 
 Purpose:
-- Read ranked_v0.csv
-- Identify risk flags that momentum scoring can hide
-- Emit a short, sceptical markdown audit per ticker
+- Observe instruments already queued for attention
+- Surface structural risks and data conditions
+- Provide sceptical context WITHOUT decisions
 
-No recommendations. No APIs. Fully deterministic.
+Inputs:
+- outputs/thesis_queue.csv
+- outputs/scores_current.parquet
+
+Outputs:
+- outputs/audits/{instrument_id}_audit.md
+
+Deterministic. Event-driven. Observational only.
 """
 
 from pathlib import Path
+from datetime import datetime, UTC
 import pandas as pd
 import textwrap
 
-IN = Path("outputs/ranked_v0.csv")
-OUT = Path("outputs/audits")
-OUT.mkdir(exist_ok=True)
 
+# ---------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+QUEUE = BASE_DIR / "outputs" / "thesis_queue.csv"
+SCORES = BASE_DIR / "outputs" / "scores_current.parquet"
+
+OUT_DIR = BASE_DIR / "outputs" / "audits"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Audit logic (OBSERVATIONS ONLY)
+# ---------------------------------------------------------------------
 
 def audit_row(row: pd.Series) -> str:
-    ticker = row["ticker"]
+    instrument_id = row["instrument_id"]
+
     score = row["score"]
-    ret_1y = row["ret_1y"]
+    delta = row["score_delta"]
     vol = row["vol_20d"]
     liq = row["avg_turnover_20d"]
 
-    flags = []
+    flags: list[str] = []
 
-    # --- Risk rules (explicit and inspectable) ---
+    # --- Structural observations (explicit & inspectable) ---
 
     if vol > 0.05:
-        flags.append("Very high short-term volatility")
+        flags.append("Short-term volatility exceeds typical momentum regime")
 
     if liq < 500_000:
-        flags.append("Thin liquidity — execution risk")
+        flags.append("Liquidity below £500k/day — execution sensitivity")
 
-    if ret_1y > 0.5 and liq < 1_000_000:
-        flags.append("Strong momentum combined with weak liquidity")
+    if delta > 1.25 and vol > 0.04:
+        flags.append("Score acceleration coincides with elevated volatility")
 
-    if ret_1y > 0.6 and vol > 0.04:
-        flags.append("Momentum appears volatility-driven")
+    if delta > 1.25 and liq < 1_000_000:
+        flags.append("Strong score movement on moderate liquidity")
 
     if not flags:
-        flags.append("No major structural red flags detected")
+        flags.append("No immediate structural stress signals detected")
 
     flag_text = "\n".join(f"- {f}" for f in flags)
 
-    judgement = (
-        "High-risk momentum profile — deserves scepticism"
-        if any("Very high" in f or "Thin liquidity" in f for f in flags)
-        else "Acceptable risk, but still momentum-dependent"
-    )
-
     md = f"""
-    # Audit: {ticker}
+    # Audit: {instrument_id}
 
-    **Composite score:** {score:.2f}
-
-    ## Key metrics
-    - **1Y return:** {ret_1y:.1%}
+    ## Context
+    - **Current score:** {score:.2f}
+    - **Score delta:** {delta:+.2f}
     - **20d volatility:** {vol:.2%}
     - **Avg £ turnover (20d):** £{liq:,.0f}
 
-    ## Risk flags
+    ## Observations
     {flag_text}
 
-    ## Auditor judgement
-    {judgement}
+    ## Auditor note
+    These observations highlight **conditions that can reduce the
+    durability of momentum signals**. They are **not a recommendation**
+    and do not invalidate the trigger by themselves.
 
-    ## Sceptical stance
-    Momentum signals can decay quickly. This name should only
-    be trusted while both **liquidity and volatility remain stable**.
+    The role of the Auditor is to surface **context and fragility** so
+    downstream judgement can be better informed.
     """
 
     return textwrap.dedent(md).strip()
 
 
-def run(top_n: int = 10) -> None:
-    df = pd.read_csv(IN)
-    top = df.sort_values("score", ascending=False).head(top_n)
+# ---------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------
 
-    for _, row in top.iterrows():
-        audit = audit_row(row)
-        out = OUT / f"{row['ticker']}_audit.md"
-        out.write_text(audit, encoding="utf-8")
+def run(max_per_run: int = 10) -> None:
+    if not QUEUE.exists():
+        print("✓ No thesis queue found — nothing to audit")
+        return
 
-    print(f"Generated {len(top)} audits in {OUT}/")
+    queue = pd.read_csv(QUEUE)
+
+    if "status" not in queue.columns:
+        print("✓ Queue has no lifecycle state — skipping audit")
+        return
+
+    pending = queue[queue["status"] == "queued"]
+
+    if pending.empty:
+        print("✓ No queued instruments to audit")
+        return
+
+    scores = pd.read_parquet(SCORES)
+
+    merged = pending.merge(
+        scores,
+        on="instrument_id",
+        how="left",
+        suffixes=("", "_score"),
+    )
+
+    audited = 0
+
+    for _, row in merged.head(max_per_run).iterrows():
+        instrument_id = row["instrument_id"]
+        print(f"▶ Auditing {instrument_id}")
+
+        audit_md = audit_row(row)
+
+        out = OUT_DIR / f"{instrument_id}_audit.md"
+        out.write_text(audit_md, encoding="utf-8")
+
+        audited += 1
+
+    print(f"✓ Audited {audited} queued instruments → {OUT_DIR}")
 
 
 if __name__ == "__main__":

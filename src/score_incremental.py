@@ -15,7 +15,6 @@ Outputs:
 from pathlib import Path
 import pandas as pd
 from datetime import datetime, UTC
-import numpy as np
 import time
 
 

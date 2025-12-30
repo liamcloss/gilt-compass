@@ -1,94 +1,146 @@
 """
-Thesis Agent (v0)
+Thesis Agent (Queue-driven, v1)
 
-Reads ranked_v0.csv and emits a short, sceptical markdown thesis per ticker.
-Decision-support only. No recommendations. No APIs. Fully deterministic.
+Consumes thesis_queue.csv and emits a short, sceptical markdown thesis
+per instrument_id.
+
+Decision-support only. No recommendations.
+Deterministic. Incremental. Idempotent.
 """
 
 from pathlib import Path
 import pandas as pd
+from datetime import datetime, UTC
 import textwrap
 
-IN = Path("outputs/ranked_v0.csv")
-OUT = Path("outputs/theses")
-OUT.mkdir(exist_ok=True)
 
+# ---------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+QUEUE = BASE_DIR / "outputs" / "thesis_queue.csv"
+SCORES = BASE_DIR / "outputs" / "scores_current.parquet"
+
+OUT_DIR = BASE_DIR / "outputs" / "theses"
+OUT_DIR.mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Thesis builder
+# ---------------------------------------------------------------------
 
 def build_thesis(row: pd.Series) -> str:
     """
-    Produce a compact markdown thesis for a single ticker.
+    Produce a compact markdown thesis for a single instrument.
+    Uses score + delta context.
     """
 
-    ticker = row["ticker"]
+    instrument_id = row["instrument_id"]
     score = row["score"]
-    ret_1y = row["ret_1y"]
-    vol = row["vol_20d"]
-    liq = row["avg_turnover_20d"]
+    delta = row["score_delta"]
+    priority = row["priority"]
+    reason = row["reason"]
 
-    momentum_read = (
-        "strong" if ret_1y > 0.3 else
-        "moderate" if ret_1y > 0.1 else
-        "weak"
-    )
-
-    vol_read = (
-        "elevated" if vol > 0.04 else
-        "normal" if vol > 0.02 else
-        "low"
-    )
-
-    liq_read = (
-        "adequate" if liq > 1_000_000 else
-        "thin"
-    )
+    direction = "improving" if delta > 0 else "deteriorating"
 
     sceptic = (
-        "Is this genuine momentum, or a late-cycle chase?"
-        if momentum_read == "strong"
+        "Is this improvement durable, or a short-term factor exposure?"
+        if delta > 0
         else
-        "Is the upside sufficient to justify attention?"
+        "Is this deterioration signal or noise?"
     )
 
     md = f"""
-    # {ticker}
+    # {instrument_id}
 
-    **Composite score:** {score:.2f}
+    **Trigger:** {reason}  
+    **Priority:** {priority}
 
-    ## Snapshot
-    - **1Y return:** {ret_1y:.1%} ({momentum_read} momentum)
-    - **20d volatility:** {vol:.2%} ({vol_read})
-    - **Avg £ turnover (20d):** £{liq:,.0f} ({liq_read})
+    ## Score context
+    - **Current score:** {score:.2f}
+    - **Score change:** {delta:+.2f} ({direction})
 
     ## Interpretation
-    {ticker} screens as a **{momentum_read} momentum** name with
-    **{vol_read} volatility** and **{liq_read} liquidity**.
+    {instrument_id} entered the thesis queue due to a **{reason}** event.
+    The score has **{direction} materially**, pushing it beyond the
+    configured threshold for review.
 
-    The score is driven primarily by trailing returns, with liquidity acting
-    as a secondary filter and volatility applied as a risk penalty.
+    This is a *screening signal*, not a view. The score reflects relative
+    momentum and risk-adjusted characteristics, not fundamentals.
 
     ## Sceptical question
     > {sceptic}
 
-    ## What would change the view?
-    - Momentum rolling over on a 3–6 month basis
-    - Liquidity deteriorating below recent norms
-    - Volatility expanding without return acceleration
+    ## What would invalidate this signal?
+    - Reversion of score over the next scoring cycle
+    - Breakdown in liquidity or coverage
+    - Broader factor rotation overwhelming idiosyncratic effects
     """
 
     return textwrap.dedent(md).strip()
 
 
-def run(top_n: int = 10) -> None:
-    df = pd.read_csv(IN)
+# ---------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------
 
-    top = df.sort_values("score", ascending=False).head(top_n)
+def run(max_per_run: int = 5) -> None:
+    if not QUEUE.exists():
+        print("✓ No thesis queue found")
+        return
 
-    for _, row in top.iterrows():
-        thesis = build_thesis(row)
-        out = OUT / f"{row['ticker']}.md"
-        out.write_text(thesis, encoding="utf-8")
+    queue = pd.read_csv(QUEUE)
 
-    print(f"Generated {len(top)} theses in {OUT}/")
+    # Initialise lifecycle columns if missing
+    if "status" not in queue.columns:
+        queue["status"] = "queued"
+        queue["processed_at"] = pd.NA
+        queue["error"] = pd.NA
+
+    pending = queue[queue["status"] == "queued"]
+
+    if pending.empty:
+        print("✓ No queued theses to process")
+        return
+
+    scores = pd.read_parquet(SCORES)
+
+    processed = 0
+
+    for idx, job in pending.head(max_per_run).iterrows():
+        instrument_id = job["instrument_id"]
+        print(f"▶ Generating thesis for {instrument_id}")
+
+        try:
+            row = scores.loc[
+                scores["instrument_id"] == instrument_id
+            ].iloc[0]
+
+            thesis = build_thesis({
+                **job.to_dict(),
+                **row.to_dict(),
+            })
+
+            out_file = OUT_DIR / f"{instrument_id}.md"
+            out_file.write_text(thesis, encoding="utf-8")
+
+            queue.loc[idx, "status"] = "done"
+            queue.loc[idx, "processed_at"] = datetime.now(UTC).isoformat()
+
+            processed += 1
+            print(f"✓ Written → {out_file.name}")
+
+        except Exception as e:
+            queue.loc[idx, "status"] = "failed"
+            queue.loc[idx, "error"] = str(e)
+            queue.loc[idx, "processed_at"] = datetime.now(UTC).isoformat()
+            print(f"✗ Failed for {instrument_id}: {e}")
+
+    queue.to_csv(QUEUE, index=False)
+
+    print(f"✓ Processed {processed} thesis jobs")
 
 
 if __name__ == "__main__":

@@ -1,170 +1,113 @@
 """
-Patrician Agent (v1)
+Patrician Agent (v1.1 — fixed)
 
 Role:
-- Read ranked_v0.csv
-- Read Thesis, Auditor, and Librarian artefacts (symmetrically)
-- Arbitrate to a single conservative verdict per ticker
+- Govern attention allocation
+- Prioritise queued instruments
+- Enforce hard cognitive limits
 
-Verdicts:
-- WATCH
-- NEEDS_DEEPER_RESEARCH
-- IGNORE
+Inputs:
+- outputs/thesis_queue.csv
 
-Decision-support only. Deterministic. Inspectable.
+Outputs:
+- Mutates thesis_queue.csv with priority_rank and attention_bucket
+
+No scoring. No judgement. No filtering.
+Deterministic. Idempotent.
 """
 
 from pathlib import Path
 import pandas as pd
-import textwrap
 
-# --- Paths ---
+
+# ---------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-
-RANKED = BASE_DIR / "outputs" / "ranked_v0.csv"
-THESES_DIR = BASE_DIR / "outputs" / "theses"
-AUDITS_DIR = BASE_DIR / "outputs" / "audits"
-LIBRARY_DIR = BASE_DIR / "outputs" / "library"
-OUT_DIR = BASE_DIR / "outputs" / "verdicts"
-
-OUT_DIR.mkdir(exist_ok=True)
+QUEUE = BASE_DIR / "outputs" / "thesis_queue.csv"
 
 
-# --- Helpers ---
-def read_optional(path: Path) -> str:
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return ""
+# ---------------------------------------------------------------------
+# Config — attention governance
+# ---------------------------------------------------------------------
+
+MAX_ATTENTION_PER_RUN = 5  # hard cognitive cap
+
+PRIORITY_ORDER = {
+    "high": 0,
+    "medium": 1,
+    "low": 2,
+}
 
 
-# --- Arbitration logic ---
-def verdict_logic(
-    row: pd.Series,
-    audit_text: str,
-    library_text: str
-) -> tuple[str, str]:
-    """
-    Conservative, text-based arbitration.
-    Patrician does not compute facts — it reacts to reported artefacts.
-    """
+# ---------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------
 
-    score = row["score"]
-    ret_1y = row["ret_1y"]
-    vol = row["vol_20d"]
-    liq = row["avg_turnover_20d"]
+def run() -> None:
+    if not QUEUE.exists():
+        print("✓ No thesis queue found — nothing to govern")
+        return
 
-    audit_l = audit_text.lower()
-    library_l = library_text.lower()
+    queue = pd.read_csv(QUEUE)
 
-    # --- Auditor red flags ---
-    audit_red_flags = any(
-        phrase in audit_l
-        for phrase in [
-            "very high",
-            "thin liquidity",
-            "volatility-driven",
-        ]
+    if "status" not in queue.columns:
+        print("✓ Queue has no lifecycle state — skipping patrician")
+        return
+
+    # Work only on queued items
+    mask = queue["status"] == "queued"
+    pending = queue.loc[mask].copy()
+
+    if pending.empty:
+        print("✓ No queued instruments to prioritise")
+        return
+
+    # -----------------------------------------------------------------
+    # Normalise priority
+    # -----------------------------------------------------------------
+
+    if "priority" not in pending.columns:
+        pending["priority"] = "medium"
+
+    pending["priority_rank"] = (
+        pending["priority"]
+        .map(PRIORITY_ORDER)
+        .fillna(PRIORITY_ORDER["medium"])
+        .astype(int)
     )
 
-    # --- Librarian stability cues (facts-as-text) ---
-    unstable_history = "range:" in library_l
-    thin_history = any(
-        f"observations: {n}" in library_l
-        for n in ["1", "2", "3", "4", "5"]
+    # -----------------------------------------------------------------
+    # Sort by priority then absolute delta
+    # -----------------------------------------------------------------
+
+    if "abs_delta" not in pending.columns:
+        raise RuntimeError("Patrician requires abs_delta in thesis_queue")
+
+    pending = pending.sort_values(
+        by=["priority_rank", "abs_delta"],
+        ascending=[True, False],
     )
 
-    # --- Arbitration (ordered, conservative) ---
-    if audit_red_flags:
-        return (
-            "IGNORE",
-            "Auditor flags structural risk that outweighs the momentum signal."
-        )
+    # -----------------------------------------------------------------
+    # Assign attention buckets
+    # -----------------------------------------------------------------
 
-    if thin_history:
-        return (
-            "IGNORE",
-            "Librarian indicates insufficient price history for confidence."
-        )
+    pending["attention_bucket"] = "deferred"
+    pending.iloc[:MAX_ATTENTION_PER_RUN, pending.columns.get_loc("attention_bucket")] = "active"
 
-    if unstable_history:
-        return (
-            "NEEDS_DEEPER_RESEARCH",
-            "Librarian suggests an unstable price regime despite positive momentum."
-        )
+    # -----------------------------------------------------------------
+    # Write results back (Patrician OWNS these fields)
+    # -----------------------------------------------------------------
 
-    if score > 1.0 and ret_1y > 0.2 and liq > 1_000_000 and vol < 0.04:
-        return (
-            "WATCH",
-            "Momentum is strong with acceptable liquidity and controlled volatility."
-        )
+    queue.loc[mask, "priority_rank"] = pending["priority_rank"].values
+    queue.loc[mask, "attention_bucket"] = pending["attention_bucket"].values
 
-    if score > 0.5:
-        return (
-            "NEEDS_DEEPER_RESEARCH",
-            "Positive signal, but conviction insufficient without deeper context."
-        )
+    queue.to_csv(QUEUE, index=False)
 
-    return (
-        "IGNORE",
-        "Composite signal too weak after risk adjustment."
-    )
-
-
-# --- Runner ---
-def run(top_n: int = 10) -> None:
-    df = pd.read_csv(RANKED)
-    top = df.sort_values("score", ascending=False).head(top_n)
-
-    for _, row in top.iterrows():
-        ticker = row["ticker"]
-
-        thesis_path = THESES_DIR / f"{ticker}.md"
-        audit_path = AUDITS_DIR / f"{ticker}_audit.md"
-        library_path = LIBRARY_DIR / f"{ticker}_library.md"
-
-        thesis_text = read_optional(thesis_path)
-        audit_text = read_optional(audit_path)
-        library_text = read_optional(library_path)
-
-        verdict, rationale = verdict_logic(
-            row=row,
-            audit_text=audit_text,
-            library_text=library_text,
-        )
-
-        md = f"""
-        # Verdict: {ticker}
-
-        **Final classification:** `{verdict}`
-
-        ## Rationale
-        {rationale}
-
-        ## Signal summary
-        - **Score:** {row["score"]:.2f}
-        - **1Y return:** {row["ret_1y"]:.1%}
-        - **20d volatility:** {row["vol_20d"]:.2%}
-        - **Avg £ turnover (20d):** £{row["avg_turnover_20d"]:,.0f}
-
-        ## Thesis (excerpt)
-        {thesis_text[:500] or "_No thesis available._"}
-
-        ## Auditor (excerpt)
-        {audit_text[:500] or "_No audit available._"}
-
-        ## Librarian (excerpt)
-        {library_text[:500] or "_No library entry available._"}
-
-        ## Patrician note
-        The Patrician prioritises **signal durability and capital preservation**
-        over raw momentum. Absence of red flags is necessary but not sufficient
-        for continued attention.
-        """
-
-        out = OUT_DIR / f"{ticker}_verdict.md"
-        out.write_text(textwrap.dedent(md).strip(), encoding="utf-8")
-
-    print(f"Generated {len(top)} verdicts in {OUT_DIR}/")
+    print("✓ Patrician prioritised thesis queue")
+    print(queue["attention_bucket"].value_counts(dropna=False).to_string())
 
 
 if __name__ == "__main__":

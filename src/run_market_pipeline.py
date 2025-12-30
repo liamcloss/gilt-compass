@@ -1,7 +1,7 @@
 """
-Daily Market Pipeline – Gilt Compass
+Run  Market Pipeline – Gilt Compass
 
-Prices + scoring only.
+Prices, scoring, attention governance, and artefact generation.
 Run daily.
 """
 
@@ -24,9 +24,18 @@ def run(module: str) -> None:
 
 def main() -> None:
     steps = [
+        # --- Market data & signals ---
         "src.ingest_prices_from_universe",
         "src.score_incremental",
         "src.thesis.trigger_thesis_on_score_change",
+
+        # --- Attention governance ---
+        "src.agents.patrician",
+
+        # --- Artefact generation (only for active attention) ---
+        "src.agents.librarian",
+        "src.agents.auditor",
+        "src.agents.thesis_agent",
     ]
 
     try:
