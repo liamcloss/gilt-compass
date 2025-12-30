@@ -35,7 +35,7 @@ RUN_LOG = OUT_DIR / "score_runs.csv"
 
 
 # ---------------------------------------------------------------------
-# Feature engineering
+# Feature engineering (scoped per instrument)
 # ---------------------------------------------------------------------
 
 def score_instrument(df: pd.DataFrame) -> dict | None:
@@ -52,7 +52,8 @@ def score_instrument(df: pd.DataFrame) -> dict | None:
 
     ret_1y = (last["close"] / first["close"]) - 1
 
-    df["daily_ret"] = df["close"].pct_change()
+    # FIX: explicitly disable forward-fill (future-safe)
+    df["daily_ret"] = df["close"].pct_change(fill_method=None)
     vol_20d = df["daily_ret"].rolling(20).std().iloc[-1]
 
     avg_turnover_20d = (
@@ -112,7 +113,7 @@ def run() -> None:
                 "scored_at": datetime.now(UTC).isoformat(),
             })
 
-        # ---- Progress output ----
+        # Progress output
         if i == 1 or i % 25 == 0 or i == total:
             elapsed = time.time() - start_time
             rate = elapsed / i
@@ -126,19 +127,13 @@ def run() -> None:
 
     scored = pd.DataFrame(rows)
 
-    # ---------------------------------------------------------------
-    # Normalise & score
-    # ---------------------------------------------------------------
-
+    # Normalise & score (relative to new batch)
     scored["z_mom"] = zscore(scored["ret_1y"])
     scored["z_vol"] = zscore(scored["vol_20d"])
 
     scored["score"] = scored["z_mom"] - 0.5 * scored["z_vol"]
 
-    # ---------------------------------------------------------------
     # Persist
-    # ---------------------------------------------------------------
-
     if not existing.empty:
         scored = pd.concat([existing, scored], ignore_index=True)
 
