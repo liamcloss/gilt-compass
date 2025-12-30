@@ -14,8 +14,9 @@ Outputs:
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, UTC
 import numpy as np
+import time
 
 
 # ---------------------------------------------------------------------
@@ -34,14 +35,13 @@ RUN_LOG = OUT_DIR / "score_runs.csv"
 
 
 # ---------------------------------------------------------------------
-# Feature engineering (same logic as before, scoped per instrument)
+# Feature engineering
 # ---------------------------------------------------------------------
 
-def score_instrument(df: pd.DataFrame) -> dict:
+def score_instrument(df: pd.DataFrame) -> dict | None:
     """
     Compute momentum-style features for a single instrument.
     """
-
     df = df.sort_values("date")
 
     if len(df) < 60:
@@ -79,11 +79,7 @@ def zscore(series: pd.Series) -> pd.Series:
 def run() -> None:
     prices = pd.read_parquet(PRICES)
 
-    # ---------------------------------------------------------------
-    # Determine what needs scoring
-    # ---------------------------------------------------------------
-
-    prices["date"] = pd.to_datetime(prices["date"])
+    prices["date"] = pd.to_datetime(prices["date"], utc=True)
     last_price_date = prices.groupby("instrument_id")["date"].max()
 
     if SCORES.exists():
@@ -93,50 +89,51 @@ def run() -> None:
         existing = pd.DataFrame()
         scored_ids = set()
 
-    to_score = set(last_price_date.index) - scored_ids
+    to_score = list(set(last_price_date.index) - scored_ids)
 
-    print(f"▶ Scoring {len(to_score):,} instruments")
+    total = len(to_score)
+    print(f"▶ Scoring {total:,} instruments")
 
-    if not to_score:
+    if total == 0:
         print("✓ No new instruments to score")
         return
 
-    # ---------------------------------------------------------------
-    # Score only new instruments
-    # ---------------------------------------------------------------
-
     rows = []
+    start_time = time.time()
 
-    for instrument_id in to_score:
+    for i, instrument_id in enumerate(to_score, 1):
         df = prices[prices["instrument_id"] == instrument_id]
         features = score_instrument(df)
 
-        if features is None:
-            continue
+        if features is not None:
+            rows.append({
+                "instrument_id": instrument_id,
+                **features,
+                "scored_at": datetime.now(UTC).isoformat(),
+            })
 
-        rows.append({
-            "instrument_id": instrument_id,
-            **features,
-            "scored_at": datetime.utcnow().isoformat(),
-        })
+        # ---- Progress output ----
+        if i == 1 or i % 25 == 0 or i == total:
+            elapsed = time.time() - start_time
+            rate = elapsed / i
+            eta = int(rate * (total - i))
+            pct = int((i / total) * 100)
+            print(f"[{i}/{total}] {pct}% | ETA ≈ {eta}s")
 
-    scored = pd.DataFrame(rows)
-
-    if scored.empty:
+    if not rows:
         print("✓ No instruments met scoring criteria")
         return
 
+    scored = pd.DataFrame(rows)
+
     # ---------------------------------------------------------------
-    # Normalise & score (relative to new batch)
+    # Normalise & score
     # ---------------------------------------------------------------
 
     scored["z_mom"] = zscore(scored["ret_1y"])
     scored["z_vol"] = zscore(scored["vol_20d"])
 
-    scored["score"] = (
-        scored["z_mom"]
-        - 0.5 * scored["z_vol"]
-    )
+    scored["score"] = scored["z_mom"] - 0.5 * scored["z_vol"]
 
     # ---------------------------------------------------------------
     # Persist
@@ -148,7 +145,7 @@ def run() -> None:
     scored.to_parquet(SCORES, index=False)
 
     run_log = pd.DataFrame([{
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "new_scored": len(rows),
     }])
 

@@ -2,16 +2,24 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
-from typing import Dict
+from typing import Dict, Tuple, Optional, Callable, cast
 import time
 import gc
-import csv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 from filelock import FileLock, Timeout
+
+
+# =====================================================================
+# Types
+# =====================================================================
+
+PricePayload = Tuple[str, str, str, str, str, str]  # ticker, instrument_id, symbol, market, start, end
+LastDateMap = Dict[str, pd.Timestamp]
 
 
 # =====================================================================
@@ -33,152 +41,86 @@ LOCK_FILE = OUT_DIR / ".price_ingest.lock"
 # Config
 # =====================================================================
 
-DEBUG_MODE = False
-DEBUG_MAX_INSTRUMENTS = 100
+PRICE_FRESHNESS_HOURS = 12
 
 DAILY_BACKFILL_DAYS = 10
+MIN_BACKFILL_DAYS = 2
 MAX_LOOKBACK_DAYS = 365
-CHECKPOINT_EVERY = 25
 
-MAX_WORKERS = 4
-REQUEST_SLEEP_SECONDS = 0.35
+MAX_WORKERS = 2
+REQUEST_SLEEP_SECONDS = 1.0
 LOCK_TIMEOUT_SECONDS = 5
 
-NO_DATA_EXCLUSION_THRESHOLD = 3
-NO_DATA_PATTERNS = [
-    "no data",
-    "possibly delisted",
-    "no timezone",
-    "no objects to concatenate",
-]
+RATE_LIMIT_SLEEP_SECONDS = 120
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_ABORT_THRESHOLD = 5
 
-
-# =====================================================================
-# Failure telemetry (learning exclusions)
-# =====================================================================
-
-FAILURE_COLUMNS = [
-    "instrument_id",
-    "symbol",
-    "market",
-    "last_attempt",
-    "attempt_count",
-    "last_error",
-]
-
-
-def load_failures() -> pd.DataFrame:
-    if not FAILURES_OUT.exists():
-        return pd.DataFrame(columns=FAILURE_COLUMNS)
-
-    df = pd.read_csv(
-        str(FAILURES_OUT),
-        parse_dates=["last_attempt"],
-        engine="python",
-        on_bad_lines="skip",
-    )
-
-    for col in FAILURE_COLUMNS:
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    return df[FAILURE_COLUMNS]
-
-
-def record_no_data_failure(
-    instrument_id: str,
-    symbol: str,
-    market: str,
-    error: str,
-) -> None:
-    df = load_failures()
-    existing = df[df["instrument_id"] == instrument_id]
-
-    attempt = int(existing["attempt_count"].iloc[0]) + 1 if not existing.empty else 1
-    df = df[df["instrument_id"] != instrument_id]
-
-    df = pd.concat(
-        [
-            df,
-            pd.DataFrame([{
-                "instrument_id": instrument_id,
-                "symbol": symbol,
-                "market": market,
-                "last_attempt": datetime.now(UTC),
-                "attempt_count": attempt,
-                "last_error": error,
-            }]),
-        ],
-        ignore_index=True,
-    )
-
-    df.to_csv(str(FAILURES_OUT), index=False, quoting=csv.QUOTE_ALL)
-
-
-def load_excluded_instruments() -> set[str]:
-    if not FAILURES_OUT.exists():
-        return set()
-
-    df = load_failures()
-
-    mask = (
-        df["last_error"]
-        .astype(str)
-        .str.lower()
-        .apply(lambda x: any(p in x for p in NO_DATA_PATTERNS))
-        & (df["attempt_count"] >= NO_DATA_EXCLUSION_THRESHOLD)
-    )
-
-    return set(df.loc[mask, "instrument_id"])
+CHECKPOINT_EVERY = 25
 
 
 # =====================================================================
 # Incremental state
 # =====================================================================
 
-def load_last_price_dates() -> Dict[str, pd.Timestamp]:
+def load_last_price_dates() -> LastDateMap:
     if not PRICES_OUT.exists():
         return {}
 
-    prices = pd.read_parquet(str(PRICES_OUT), columns=["instrument_id", "date"])
+    prices = pd.read_parquet(PRICES_OUT, columns=["instrument_id", "date"])
     prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce")
 
-    raw = prices.groupby("instrument_id")["date"].max().to_dict()
-    return {
-        str(k): pd.Timestamp(v)
-        for k, v in raw.items()
-        if pd.notna(v)
-    }
+    raw = (
+        prices
+        .dropna(subset=["instrument_id", "date"])
+        .groupby("instrument_id")["date"]
+        .max()
+        .to_dict()
+    )
+
+    return cast(LastDateMap, raw)
+
+
+def is_fresh(last_dt: Optional[pd.Timestamp], now: pd.Timestamp) -> bool:
+    return last_dt is not None and (now - last_dt) < timedelta(hours=PRICE_FRESHNESS_HOURS)
 
 
 # =====================================================================
-# Schema helpers
+# Yahoo fetch (sync, thread-safe)
 # =====================================================================
 
-def ensure_series(df: pd.DataFrame, col: str) -> pd.Series:
-    s = df[col]
-    return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
-
-
-def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    return df.loc[:, ~df.columns.duplicated()].copy() if not df.columns.is_unique else df
-
-
-def normalise_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["Open", "High", "Low"]:
-        df[col] = ensure_series(df, col) if col in df.columns else df["Close"]
-
-    df["Adj Close"] = ensure_series(df, "Adj Close") if "Adj Close" in df.columns else df["Close"]
-    df["Volume"] = ensure_series(df, "Volume") if "Volume" in df.columns else None
-    return df
-
-
-def build_price_frame(
-    df: pd.DataFrame,
+def fetch_prices_yahoo(
+    ticker: str,
     instrument_id: str,
     symbol: str,
     market: str,
-) -> pd.DataFrame:
+    start: str,
+    end: str,
+) -> Optional[pd.DataFrame]:
+    try:
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            progress=False,
+            threads=False,
+        )
+    except YFRateLimitError:
+        raise
+    except (ValueError, KeyError, TypeError):
+        return None
+
+    # yfinance often rate-limits silently
+    if df is None or df.empty:
+        raise YFRateLimitError()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df = df.reset_index()
+
+    if "Date" not in df.columns or "Close" not in df.columns:
+        return None
+
     df = df.rename(columns={
         "Date": "date",
         "Open": "open",
@@ -193,7 +135,6 @@ def build_price_frame(
     df["symbol"] = symbol
     df["market"] = market
     df["price_source"] = "yahoo"
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
     return df[
         [
@@ -213,51 +154,23 @@ def build_price_frame(
 
 
 # =====================================================================
-# Yahoo fetch
+# Executor wrapper (STRICT zero-arg callable)
 # =====================================================================
 
-def fetch_prices_yahoo(
-    ticker: str,
-    instrument_id: str,
-    symbol: str,
-    market: str,
-    start: str,
-    end: str,
-) -> pd.DataFrame | None:
-    try:
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            progress=False,
-            threads=False,
-        )
-    except (ValueError, KeyError, TypeError):
-        return None
-
-    if df.empty:
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-
-    df = normalise_columns(df.reset_index())
-
-    if "Date" not in df.columns or "Close" not in df.columns:
-        return None
-
-    df = normalise_ohlcv(df)
-    return build_price_frame(df, instrument_id, symbol, market)
+def make_fetch_call(payload: PricePayload) -> Callable[[], Optional[pd.DataFrame]]:
+    def _call() -> Optional[pd.DataFrame]:
+        return fetch_prices_yahoo(*payload)
+    return _call
 
 
-# =====================================================================
-# Async wrapper
-# =====================================================================
-
-async def fetch_async(loop, executor, payload):
+async def fetch_one(
+    loop: asyncio.AbstractEventLoop,
+    executor: ThreadPoolExecutor,
+    payload: PricePayload,
+) -> Optional[pd.DataFrame]:
     await asyncio.sleep(REQUEST_SLEEP_SECONDS)
-    result = await loop.run_in_executor(executor, fetch_prices_yahoo, *payload)
-    return payload, result
+    call = make_fetch_call(payload)
+    return await loop.run_in_executor(executor, call)
 
 
 # =====================================================================
@@ -265,31 +178,24 @@ async def fetch_async(loop, executor, payload):
 # =====================================================================
 
 def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
-    valid = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty]
-    frames.clear()
-
-    if not valid:
+    if not frames:
         return
 
-    prices = pd.concat(valid, ignore_index=True)
+    prices = pd.concat(frames, ignore_index=True)
+    frames.clear()
+
     prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce")
     prices = prices.dropna(subset=["instrument_id", "date"])
 
-    prices["volume"] = (
-        pd.to_numeric(prices["volume"], errors="coerce")
-        .round()
-        .astype("Int64")
-    )
-
     if PRICES_OUT.exists():
-        existing = pd.read_parquet(str(PRICES_OUT))
+        existing = pd.read_parquet(PRICES_OUT)
         existing["date"] = pd.to_datetime(existing["date"], utc=True, errors="coerce")
         prices = pd.concat([existing, prices], ignore_index=True)
 
     prices = prices.drop_duplicates(["instrument_id", "date"], keep="last")
-    prices.to_parquet(str(PRICES_OUT), index=False)
+    prices.to_parquet(PRICES_OUT, index=False)
 
-    print(f"✓ Prices written ({len(prices):,} rows total)")
+    print(f"✓ Prices written ({len(prices):,} rows)")
     gc.collect()
 
 
@@ -297,87 +203,86 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 # Main
 # =====================================================================
 
-async def run_async():
-    universe = pd.read_csv(str(UNIVERSE))
+async def run_async() -> None:
+    universe = pd.read_csv(UNIVERSE)
     last_dates = load_last_price_dates()
-    excluded = load_excluded_instruments()
 
-    candidates = (
-        universe[
-            (universe["active"] == True)
-            & (universe["price_eligible"] == True)
-            & (~universe["instrument_id"].isin(excluded))
-        ]
-        .sort_values("instrument_id")
-        .drop_duplicates("instrument_id")
-    )
+    now = pd.Timestamp(datetime.now(UTC))
 
-    if DEBUG_MODE:
-        candidates = candidates.head(DEBUG_MAX_INSTRUMENTS)
-        print(f"⚠ DEBUG MODE: limiting to {len(candidates)} instruments")
+    candidates = universe[
+        (universe["active"] == True)
+        & (universe["price_eligible"] == True)
+    ]
 
-    end = datetime.now(UTC)
-    loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    tasks: list[PricePayload] = []
+    skipped = 0
 
-    tasks = []
     for _, r in candidates.iterrows():
         last_dt = last_dates.get(r["instrument_id"])
+
+        if is_fresh(last_dt, now):
+            skipped += 1
+            continue
+
         start_dt = (
-            last_dt - timedelta(days=DAILY_BACKFILL_DAYS)
+            max(last_dt - timedelta(days=DAILY_BACKFILL_DAYS), now - timedelta(days=MIN_BACKFILL_DAYS))
             if last_dt is not None
-            else end - timedelta(days=MAX_LOOKBACK_DAYS)
+            else now - timedelta(days=MAX_LOOKBACK_DAYS)
         )
 
-        payload = (
+        tasks.append((
             f"{r['symbol']}.L" if r["market"] == "GB" else r["symbol"],
             r["instrument_id"],
             r["symbol"],
             r["market"],
             start_dt.strftime("%Y-%m-%d"),
-            end.strftime("%Y-%m-%d"),
-        )
+            now.strftime("%Y-%m-%d"),
+        ))
 
-        tasks.append(fetch_async(loop, executor, payload))
+    print(f"✓ Skipped fresh (<{PRICE_FRESHNESS_HOURS}h): {skipped:,}")
+    print(f"✓ Fetching prices for: {len(tasks):,}")
 
-    ok = no_data = 0
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
     frames: list[pd.DataFrame] = []
+    rate_limit_hits = 0
     start_time = time.time()
 
-    for idx, coro in enumerate(asyncio.as_completed(tasks), 1):
-        payload, result = await coro
-        _, instrument_id, symbol, market, *_ = payload
+    for idx, payload in enumerate(tasks, 1):
+        retries = 0
+
+        while True:
+            try:
+                result = await fetch_one(loop, executor, payload)
+                break
+            except YFRateLimitError:
+                rate_limit_hits += 1
+                retries += 1
+
+                if rate_limit_hits >= RATE_LIMIT_ABORT_THRESHOLD:
+                    raise RuntimeError("Yahoo rate-limit circuit breaker tripped")
+
+                if retries > RATE_LIMIT_MAX_RETRIES:
+                    raise RuntimeError("Yahoo rate-limit persists")
+
+                print(f"⚠ Yahoo rate limit — sleeping {RATE_LIMIT_SLEEP_SECONDS}s")
+                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
 
         if isinstance(result, pd.DataFrame):
             frames.append(result)
-            ok += 1
-        else:
-            no_data += 1
-            record_no_data_failure(
-                instrument_id,
-                symbol,
-                market,
-                "no usable yahoo price data",
-            )
 
         if idx % CHECKPOINT_EVERY == 0:
             checkpoint_prices(frames)
 
-        elapsed = time.time() - start_time
-        eta = int((elapsed / idx) * (len(tasks) - idx))
-        print(f"[{idx}/{len(tasks)}] ok={ok} no_data={no_data} ETA≈{eta}s")
+        eta = int((time.time() - start_time) / idx * (len(tasks) - idx))
+        print(f"[{idx}/{len(tasks)}] ETA≈{eta}s")
 
     checkpoint_prices(frames)
     executor.shutdown(wait=True)
 
-    print(
-        f"\n✓ Run complete | tasks={len(tasks)} | "
-        f"ok={ok} | no_data={no_data} | "
-        f"elapsed={int(time.time() - start_time)}s"
-    )
 
-
-def run():
+def run() -> None:
     try:
         with FileLock(str(LOCK_FILE), timeout=LOCK_TIMEOUT_SECONDS):
             asyncio.run(run_async())
