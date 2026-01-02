@@ -4,3 +4,4 @@ requests>=2.31
 yfinance>=0.2.36
 filelock>=3.13
 python-dotenv>=1.0
+pyarrow>=14.0
