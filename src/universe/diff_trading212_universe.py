@@ -30,10 +30,15 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Helpers
 # ---------------------------------------------------------------------
 
-def latest_two_snapshots() -> tuple[Path, Path]:
+def latest_two_snapshots() -> tuple[Path | None, Path]:
     files = sorted(RAW_DIR.glob("trading212_raw_*.parquet"))
-    if len(files) < 2:
-        raise RuntimeError("Need at least two Trading 212 snapshots to diff")
+
+    if not files:
+        raise RuntimeError("No Trading 212 snapshots found")
+
+    if len(files) == 1:
+        return None, files[0]
+
     return files[-2], files[-1]
 
 
