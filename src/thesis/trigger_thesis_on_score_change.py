@@ -8,7 +8,7 @@ Rules:
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------
@@ -76,7 +76,7 @@ def run() -> None:
         "score_delta",
     ]].copy()
 
-    queue["enqueued_at"] = datetime.utcnow().isoformat()
+    queue["enqueued_at"] = datetime.now(timezone.utc).isoformat()
     queue["reason"] = queue.apply(
         lambda r: "new" if r["score_prev"] == 0 else "score_change",
         axis=1,

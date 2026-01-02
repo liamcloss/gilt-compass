@@ -10,7 +10,7 @@ Rules:
 """
 
 from pathlib import Path
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import pandas as pd
 
 
@@ -119,7 +119,7 @@ def run() -> None:
     # Mark inactive
     # -----------------------------------------------------------------
 
-    today = datetime.now(UTC).date().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
 
     universe.loc[mask, "active"] = False
     universe.loc[mask, "inactive_on"] = today

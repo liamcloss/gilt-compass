@@ -11,7 +11,7 @@ Deterministic. Inspectable. Idempotent.
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------
@@ -141,7 +141,7 @@ def run() -> None:
 
     diff = diff_universe(prev, curr)
 
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     # -----------------------------------------------------------------
     # Write automation-friendly artefacts
