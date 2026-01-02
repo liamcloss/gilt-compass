@@ -136,10 +136,14 @@ def diff_universe(prev: pd.DataFrame, curr: pd.DataFrame) -> dict:
 
 def run() -> None:
     prev_path, curr_path = latest_two_snapshots()
-
     print("▶ Diffing Trading 212 snapshots")
-    print(f"  - Previous: {prev_path.name}")
     print(f"  - Current : {curr_path.name}")
+
+    if prev_path is None:
+        print("ℹ First snapshot detected — establishing baseline")
+        return
+
+    print(f"  - Previous: {prev_path.name}")
 
     prev = derive_instrument_id(load_snapshot(prev_path))
     curr = derive_instrument_id(load_snapshot(curr_path))
