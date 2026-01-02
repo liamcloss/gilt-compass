@@ -14,7 +14,7 @@ Outputs:
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import numpy as np
 import time
 
@@ -110,7 +110,7 @@ def run() -> None:
             rows.append({
                 "instrument_id": instrument_id,
                 **features,
-                "scored_at": datetime.now(UTC).isoformat(),
+                "scored_at": datetime.now(timezone.utc).isoformat(),
             })
 
         # Progress output
@@ -140,7 +140,7 @@ def run() -> None:
     scored.to_parquet(SCORES, index=False)
 
     run_log = pd.DataFrame([{
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "new_scored": len(rows),
     }])
 

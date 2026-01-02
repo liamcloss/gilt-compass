@@ -207,7 +207,7 @@ async def run_async() -> None:
     universe = pd.read_csv(UNIVERSE)
     last_dates = load_last_price_dates()
 
-    now = pd.Timestamp(datetime.now(UTC))
+    now = pd.Timestamp(datetime.now(utc))
 
     candidates = universe[
         (universe["active"] == True)

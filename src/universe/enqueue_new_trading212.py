@@ -7,7 +7,7 @@ Idempotent and safe to re-run.
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------
@@ -81,7 +81,7 @@ def run() -> None:
     # Defaults
     # -----------------------------------------------------------------
 
-    now = datetime.utcnow().date().isoformat()
+    now = datetime.timezone.now(timezone.utc).date().isoformat()
 
     new["added_on"] = new.get("added_on", now)
     new["active"] = new.get("active", True)
