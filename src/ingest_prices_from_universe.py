@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, Callable, cast
 import time
 import gc
@@ -12,6 +12,7 @@ import pandas as pd
 import yfinance as yf
 from yfinance.exceptions import YFRateLimitError
 from filelock import FileLock, Timeout
+
 
 
 # =====================================================================
@@ -207,7 +208,7 @@ async def run_async() -> None:
     universe = pd.read_csv(UNIVERSE)
     last_dates = load_last_price_dates()
 
-    now = pd.Timestamp(datetime.now(utc))
+    now = pd.Timestamp(datetime.now(timezone.utc))
 
     candidates = universe[
         (universe["active"] == True)
