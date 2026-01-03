@@ -21,12 +21,11 @@ from filelock import FileLock, Timeout
 # =====================================================================
 # MODE
 # =====================================================================
-# Set once, run, forget.
-#   "BOOTSTRAP" → first big universe ingest
-#   "DAILY"     → normal incremental operation
+# "BOOTSTRAP" → first full universe ingest
+# "DAILY"     → normal incremental run
 # =====================================================================
 
-MODE = "BOOTSTRAP"   # ← change to "DAILY" after first run
+MODE = "BOOTSTRAP"
 
 
 # =====================================================================
@@ -62,21 +61,19 @@ if MODE == "BOOTSTRAP":
     REQUEST_SLEEP_SECONDS = 0.05
     BURST_SIZE = 400
     BURST_COOLDOWN_SECONDS = 45
-    MAX_FAILURES_BEFORE_EXCLUDE = 3
-else:  # DAILY
+else:
     MAX_WORKERS = 8
     REQUEST_SLEEP_SECONDS = 0.05
     BURST_SIZE = 100
     BURST_COOLDOWN_SECONDS = 120
-    MAX_FAILURES_BEFORE_EXCLUDE = 3
 
+MAX_FAILURES_BEFORE_EXCLUDE = 3
 DAILY_BACKFILL_DAYS = 10
 MIN_BACKFILL_DAYS = 2
 MAX_LOOKBACK_DAYS = 365
-
+CHECKPOINT_EVERY = 25
 LOCK_TIMEOUT_SECONDS = 5
 RATE_LIMIT_SLEEP_SECONDS = 120
-CHECKPOINT_EVERY = 25
 
 
 # =====================================================================
@@ -97,6 +94,45 @@ def normalise_market(market: Optional[str]) -> Optional[str]:
         return "GB"
     if m in {"US", "NYSE", "NASDAQ"}:
         return "US"
+    return None
+
+
+# =====================================================================
+# Yahoo ticker derivation (CRITICAL FIX)
+# =====================================================================
+
+def derive_yahoo_ticker(
+    instrument_id: str,
+    symbol: str,
+    market: Optional[str],
+) -> Optional[str]:
+    """
+    Convert Trading 212 identifiers to Yahoo-compatible tickers.
+    Fail closed if not confident.
+    """
+
+    # Clean symbol already suitable
+    if symbol.isupper() and symbol.isalpha() and 1 <= len(symbol) <= 5:
+        return symbol
+
+    # LSE / AIM
+    if instrument_id.endswith("l_EQ"):
+        base = instrument_id.replace("l_EQ", "")
+        if base.isalnum():
+            return f"{base}.L"
+
+    # US
+    if instrument_id.endswith("_US_EQ"):
+        base = instrument_id.replace("_US_EQ", "")
+        if base.isalnum():
+            return base
+
+    # Canada
+    if instrument_id.endswith("_CA_EQ"):
+        base = instrument_id.replace("_CA_EQ", "")
+        if base.isalnum():
+            return f"{base}.TO"
+
     return None
 
 
@@ -147,10 +183,7 @@ def load_eligibility_state() -> pd.DataFrame:
             "last_attempt_utc",
             "last_success_utc",
         ])
-    df = pd.read_parquet(ELIGIBILITY_OUT)
-    if "fail_count" not in df.columns:
-        df["fail_count"] = 0
-    return df
+    return pd.read_parquet(ELIGIBILITY_OUT)
 
 
 def save_eligibility_state(state: pd.DataFrame) -> None:
@@ -159,7 +192,7 @@ def save_eligibility_state(state: pd.DataFrame) -> None:
 
 def upsert_state(state: pd.DataFrame, update: dict) -> pd.DataFrame:
     iid = update["instrument_id"]
-    if state.empty or iid not in set(state["instrument_id"]):
+    if iid not in set(state["instrument_id"]):
         return pd.concat([state, pd.DataFrame([update])], ignore_index=True)
 
     idx = state.index[state["instrument_id"] == iid][0]
@@ -168,27 +201,16 @@ def upsert_state(state: pd.DataFrame, update: dict) -> pd.DataFrame:
     return state
 
 
-def is_fresh(
-    last_dt: Optional[pd.Timestamp],
-    now: pd.Timestamp,
-    market: Optional[str],
-) -> bool:
+def is_fresh(last_dt: Optional[pd.Timestamp], now: pd.Timestamp, market: Optional[str]) -> bool:
     if last_dt is None:
         return False
-
     norm = normalise_market(market)
     if norm is None:
         return False
 
     cfg = MARKET_CLOSES[norm]
     now_local = now.tz_convert(cfg["tz"])
-
-    latest_close = (
-        now_local.date()
-        if now_local.time() >= cfg["close_time"]
-        else now_local.date() - timedelta(days=1)
-    )
-
+    latest_close = now_local.date() if now_local.time() >= cfg["close_time"] else now_local.date() - timedelta(days=1)
     return last_dt.date() >= latest_close
 
 
@@ -196,12 +218,7 @@ def is_fresh(
 # Failure logging (audit)
 # =====================================================================
 
-def log_failure(
-    instrument_id: str,
-    symbol: str,
-    market: Optional[str],
-    reason: str,
-) -> None:
+def log_failure(instrument_id: str, symbol: str, market: Optional[str], reason: str) -> None:
     row = pd.DataFrame([{
         "ts_utc": pd.Timestamp.utcnow(),
         "instrument_id": instrument_id,
@@ -209,10 +226,8 @@ def log_failure(
         "market": market,
         "reason": reason,
     }])
-
     if FAILURES_OUT.exists():
         row = pd.concat([pd.read_csv(FAILURES_OUT), row], ignore_index=True)
-
     row.to_csv(FAILURES_OUT, index=False)
 
 
@@ -230,13 +245,7 @@ def fetch_prices_yahoo(
 ) -> Optional[pd.DataFrame]:
     try:
         with suppress_stdout_stderr():
-            df = yf.download(
-                ticker,
-                start=start,
-                end=end,
-                progress=False,
-                threads=False,
-            )
+            df = yf.download(ticker, start=start, end=end, progress=False, threads=False)
     except YFRateLimitError:
         raise
     except Exception:
@@ -271,19 +280,8 @@ def fetch_prices_yahoo(
     df["price_source"] = "yahoo"
 
     return df[
-        [
-            "instrument_id",
-            "symbol",
-            "market",
-            "price_source",
-            "date",
-            "open",
-            "high",
-            "low",
-            "close",
-            "adj_close",
-            "volume",
-        ]
+        ["instrument_id", "symbol", "market", "price_source",
+         "date", "open", "high", "low", "close", "adj_close", "volume"]
     ]
 
 
@@ -307,10 +305,8 @@ async def fetch_one(loop, executor, payload):
 def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
     if not frames:
         return
-
     prices = pd.concat(frames, ignore_index=True)
     frames.clear()
-
     prices["date"] = pd.to_datetime(prices["date"], utc=True)
     prices = prices.dropna(subset=["instrument_id", "date"])
 
@@ -319,8 +315,6 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 
     prices.drop_duplicates(["instrument_id", "date"], keep="last", inplace=True)
     prices.to_parquet(PRICES_OUT, index=False)
-
-    print(f"✓ Checkpoint written — total rows: {len(prices):,}")
     gc.collect()
 
 
@@ -331,18 +325,14 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 async def run_async() -> None:
     universe = pd.read_csv(UNIVERSE)
 
-    REQUIRED_COLUMNS = {"instrument_id", "symbol", "active", "price_eligible"}
-    missing = REQUIRED_COLUMNS - set(universe.columns)
-    if missing:
-        raise ValueError(f"Universe missing required columns: {missing}")
+    required = {"instrument_id", "symbol", "active", "price_eligible"}
+    if not required.issubset(universe.columns):
+        raise ValueError(f"Universe missing required columns: {required - set(universe.columns)}")
 
     if "market" not in universe.columns:
         universe["market"] = None
 
-    candidates = universe[
-        (universe["active"] == True)
-        & (universe["price_eligible"] == True)
-    ]
+    candidates = universe[(universe["active"] == True) & (universe["price_eligible"] == True)]
 
     last_dates = load_last_price_dates()
     state = load_eligibility_state()
@@ -351,52 +341,35 @@ async def run_async() -> None:
     now = pd.Timestamp(datetime.now(timezone.utc))
     tasks: list[PricePayload] = []
 
-    skipped_fresh = skipped_failed = 0
-
     for _, r in candidates.iterrows():
         iid = r["instrument_id"]
-        market = r.get("market")
 
-        if iid in state_idx.index:
-            if int(state_idx.loc[iid, "fail_count"]) >= MAX_FAILURES_BEFORE_EXCLUDE:
-                skipped_failed += 1
-                continue
-
-        if is_fresh(last_dates.get(iid), now, market):
-            skipped_fresh += 1
+        if iid in state_idx.index and state_idx.loc[iid, "fail_count"] >= MAX_FAILURES_BEFORE_EXCLUDE:
             continue
 
-        norm = normalise_market(market)
-        ticker = f"{r['symbol']}.L" if norm == "GB" else r["symbol"]
+        if is_fresh(last_dates.get(iid), now, r.get("market")):
+            continue
+
+        ticker = derive_yahoo_ticker(iid, r["symbol"], r.get("market"))
+        if ticker is None:
+            log_failure(iid, r["symbol"], r.get("market"), "no_yahoo_mapping")
+            continue
 
         start_dt = (
-            min(
-                last_dates[iid] - timedelta(days=DAILY_BACKFILL_DAYS),
-                now - timedelta(days=MIN_BACKFILL_DAYS),
-            )
+            min(last_dates[iid] - timedelta(days=DAILY_BACKFILL_DAYS), now - timedelta(days=MIN_BACKFILL_DAYS))
             if iid in last_dates
             else now - timedelta(days=MAX_LOOKBACK_DAYS)
         )
 
-        tasks.append((
-            ticker,
-            iid,
-            r["symbol"],
-            market,
-            start_dt.strftime("%Y-%m-%d"),
-            now.strftime("%Y-%m-%d"),
-        ))
+        tasks.append((ticker, iid, r["symbol"], r.get("market"),
+                      start_dt.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")))
 
-    print(f"Mode: {MODE}")
-    print(f"✓ Skipped (fresh): {skipped_fresh:,}")
-    print(f"✓ Skipped (failed ≥{MAX_FAILURES_BEFORE_EXCLUDE}): {skipped_failed:,}")
-    print(f"✓ Fetching prices for: {len(tasks):,}")
+    print(f"Mode: {MODE} | Fetching {len(tasks):,} instruments")
 
     loop = asyncio.get_running_loop()
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     frames: list[pd.DataFrame] = []
-    success = failures = rate_limits = 0
     start_time = time.time()
 
     try:
@@ -407,13 +380,11 @@ async def run_async() -> None:
             try:
                 result = await fetch_one(loop, executor, payload)
             except YFRateLimitError:
-                rate_limits += 1
                 await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
                 continue
 
             if isinstance(result, pd.DataFrame):
                 frames.append(result)
-                success += 1
                 state = upsert_state(state, {
                     "instrument_id": iid,
                     "yahoo_ticker": payload[0],
@@ -423,9 +394,8 @@ async def run_async() -> None:
                     "last_success_utc": now_utc,
                 })
             else:
-                failures += 1
-                log_failure(iid, payload[2], payload[3], "no_data")
                 prev = int(state_idx.loc[iid, "fail_count"]) if iid in state_idx.index else 0
+                log_failure(iid, payload[2], payload[3], "no_data")
                 state = upsert_state(state, {
                     "instrument_id": iid,
                     "yahoo_ticker": payload[0],
@@ -440,21 +410,13 @@ async def run_async() -> None:
                 save_eligibility_state(state)
 
             if idx % BURST_SIZE == 0:
-                print(f"⏸ Cooling down after {idx:,} requests")
                 await asyncio.sleep(BURST_COOLDOWN_SECONDS)
-
-            eta = int((time.time() - start_time) / idx * (len(tasks) - idx))
-            print(f"[{idx}/{len(tasks)}] ETA≈{eta}s")
 
         checkpoint_prices(frames)
         save_eligibility_state(state)
 
-        print(
-            f"\n✓ Ingest complete — "
-            f"{success:,} succeeded | "
-            f"{failures:,} failed | "
-            f"{rate_limits:,} rate-limit events"
-        )
+        elapsed = int(time.time() - start_time)
+        print(f"✓ Complete in {elapsed}s")
 
     finally:
         executor.shutdown(wait=True)
