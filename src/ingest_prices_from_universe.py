@@ -22,7 +22,7 @@ from filelock import FileLock, Timeout
 # Types
 # =====================================================================
 
-PricePayload = Tuple[str, str, str, str, str, str]
+PricePayload = Tuple[str, str, str, Optional[str], str, str]
 LastDateMap = Dict[str, pd.Timestamp]
 
 
@@ -55,7 +55,6 @@ LOCK_TIMEOUT_SECONDS = 5
 
 RATE_LIMIT_SLEEP_SECONDS = 120
 RATE_LIMIT_MAX_RETRIES = 3
-RATE_LIMIT_ABORT_THRESHOLD = 5
 
 CHECKPOINT_EVERY = 25
 MAX_FAILURES_BEFORE_EXCLUDE = 1
@@ -71,7 +70,7 @@ MARKET_CLOSES = {
 }
 
 
-def normalise_market(market: str) -> Optional[str]:
+def normalise_market(market: Optional[str]) -> Optional[str]:
     if not isinstance(market, str):
         return None
     m = market.strip().upper()
@@ -129,7 +128,7 @@ def load_failure_counts() -> Dict[str, int]:
 def is_fresh(
     last_dt: Optional[pd.Timestamp],
     now: pd.Timestamp,
-    market: str,
+    market: Optional[str],
 ) -> bool:
     if last_dt is None:
         return False
@@ -157,7 +156,7 @@ def is_fresh(
 def log_failure(
     instrument_id: str,
     symbol: str,
-    market: str,
+    market: Optional[str],
     reason: str,
 ) -> None:
     row = pd.DataFrame([{
@@ -182,7 +181,7 @@ def fetch_prices_yahoo(
     ticker: str,
     instrument_id: str,
     symbol: str,
-    market: str,
+    market: Optional[str],
     start: str,
     end: str,
 ) -> Optional[pd.DataFrame]:
@@ -289,6 +288,20 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 async def run_async() -> None:
     universe = pd.read_csv(UNIVERSE)
 
+    REQUIRED_COLUMNS = {
+        "instrument_id",
+        "symbol",
+        "active",
+        "price_eligible",
+    }
+
+    missing = REQUIRED_COLUMNS - set(universe.columns)
+    if missing:
+        raise ValueError(f"Universe missing required columns: {missing}")
+
+    if "market" not in universe.columns:
+        universe["market"] = None
+
     # 🔒 HARD GUARDRAIL — DO NOT REMOVE
     candidates = universe[
         (universe["active"] == True)
@@ -305,12 +318,13 @@ async def run_async() -> None:
 
     for _, r in candidates.iterrows():
         iid = r["instrument_id"]
+        market = r.get("market")
 
         if failure_counts.get(iid, 0) >= MAX_FAILURES_BEFORE_EXCLUDE:
             skipped_failed += 1
             continue
 
-        if is_fresh(last_dates.get(iid), now, r["market"]):
+        if is_fresh(last_dates.get(iid), now, market):
             skipped_fresh += 1
             continue
 
@@ -325,7 +339,7 @@ async def run_async() -> None:
 
         ticker = (
             f"{r['symbol']}.L"
-            if normalise_market(r["market"]) == "GB"
+            if normalise_market(market) == "GB"
             else r["symbol"]
         )
 
@@ -333,7 +347,7 @@ async def run_async() -> None:
             ticker,
             iid,
             r["symbol"],
-            r["market"],
+            market,
             start_dt.strftime("%Y-%m-%d"),
             now.strftime("%Y-%m-%d"),
         ))
