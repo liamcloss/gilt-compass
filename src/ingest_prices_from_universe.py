@@ -19,6 +19,17 @@ from filelock import FileLock, Timeout
 
 
 # =====================================================================
+# MODE
+# =====================================================================
+# Set once, run, forget.
+#   "BOOTSTRAP" → first big universe ingest
+#   "DAILY"     → normal incremental operation
+# =====================================================================
+
+MODE = "BOOTSTRAP"   # ← change to "DAILY" after first run
+
+
+# =====================================================================
 # Types
 # =====================================================================
 
@@ -38,26 +49,34 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PRICES_OUT = OUT_DIR / "prices_1y.parquet"
 FAILURES_OUT = OUT_DIR / "price_ingest_failures.csv"
+ELIGIBILITY_OUT = OUT_DIR / "price_eligibility_state.parquet"
 LOCK_FILE = OUT_DIR / ".price_ingest.lock"
 
 
 # =====================================================================
-# Config
+# Config (mode dependent)
 # =====================================================================
+
+if MODE == "BOOTSTRAP":
+    MAX_WORKERS = 16
+    REQUEST_SLEEP_SECONDS = 0.05
+    BURST_SIZE = 400
+    BURST_COOLDOWN_SECONDS = 45
+    MAX_FAILURES_BEFORE_EXCLUDE = 3
+else:  # DAILY
+    MAX_WORKERS = 8
+    REQUEST_SLEEP_SECONDS = 0.05
+    BURST_SIZE = 100
+    BURST_COOLDOWN_SECONDS = 120
+    MAX_FAILURES_BEFORE_EXCLUDE = 3
 
 DAILY_BACKFILL_DAYS = 10
 MIN_BACKFILL_DAYS = 2
 MAX_LOOKBACK_DAYS = 365
 
-MAX_WORKERS = 8
-REQUEST_SLEEP_SECONDS = 0.02
 LOCK_TIMEOUT_SECONDS = 5
-
 RATE_LIMIT_SLEEP_SECONDS = 120
-RATE_LIMIT_MAX_RETRIES = 3
-
 CHECKPOINT_EVERY = 25
-MAX_FAILURES_BEFORE_EXCLUDE = 1
 
 
 # =====================================================================
@@ -118,11 +137,35 @@ def load_last_price_dates() -> LastDateMap:
     )
 
 
-def load_failure_counts() -> Dict[str, int]:
-    if not FAILURES_OUT.exists():
-        return {}
-    df = pd.read_csv(FAILURES_OUT)
-    return df.groupby("instrument_id").size().to_dict()
+def load_eligibility_state() -> pd.DataFrame:
+    if not ELIGIBILITY_OUT.exists():
+        return pd.DataFrame(columns=[
+            "instrument_id",
+            "yahoo_ticker",
+            "yahoo_verified",
+            "fail_count",
+            "last_attempt_utc",
+            "last_success_utc",
+        ])
+    df = pd.read_parquet(ELIGIBILITY_OUT)
+    if "fail_count" not in df.columns:
+        df["fail_count"] = 0
+    return df
+
+
+def save_eligibility_state(state: pd.DataFrame) -> None:
+    state.to_parquet(ELIGIBILITY_OUT, index=False)
+
+
+def upsert_state(state: pd.DataFrame, update: dict) -> pd.DataFrame:
+    iid = update["instrument_id"]
+    if state.empty or iid not in set(state["instrument_id"]):
+        return pd.concat([state, pd.DataFrame([update])], ignore_index=True)
+
+    idx = state.index[state["instrument_id"] == iid][0]
+    for k, v in update.items():
+        state.at[idx, k] = v
+    return state
 
 
 def is_fresh(
@@ -150,7 +193,7 @@ def is_fresh(
 
 
 # =====================================================================
-# Failure logging
+# Failure logging (audit)
 # =====================================================================
 
 def log_failure(
@@ -245,7 +288,7 @@ def fetch_prices_yahoo(
 
 
 # =====================================================================
-# Executor
+# Async executor
 # =====================================================================
 
 def make_fetch_call(payload: PricePayload) -> Callable[[], Optional[pd.DataFrame]]:
@@ -288,13 +331,7 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 async def run_async() -> None:
     universe = pd.read_csv(UNIVERSE)
 
-    REQUIRED_COLUMNS = {
-        "instrument_id",
-        "symbol",
-        "active",
-        "price_eligible",
-    }
-
+    REQUIRED_COLUMNS = {"instrument_id", "symbol", "active", "price_eligible"}
     missing = REQUIRED_COLUMNS - set(universe.columns)
     if missing:
         raise ValueError(f"Universe missing required columns: {missing}")
@@ -302,45 +339,43 @@ async def run_async() -> None:
     if "market" not in universe.columns:
         universe["market"] = None
 
-    # 🔒 HARD GUARDRAIL — DO NOT REMOVE
     candidates = universe[
         (universe["active"] == True)
         & (universe["price_eligible"] == True)
     ]
 
     last_dates = load_last_price_dates()
-    failure_counts = load_failure_counts()
+    state = load_eligibility_state()
+    state_idx = state.set_index("instrument_id") if not state.empty else pd.DataFrame()
 
     now = pd.Timestamp(datetime.now(timezone.utc))
-
     tasks: list[PricePayload] = []
+
     skipped_fresh = skipped_failed = 0
 
     for _, r in candidates.iterrows():
         iid = r["instrument_id"]
         market = r.get("market")
 
-        if failure_counts.get(iid, 0) >= MAX_FAILURES_BEFORE_EXCLUDE:
-            skipped_failed += 1
-            continue
+        if iid in state_idx.index:
+            if int(state_idx.loc[iid, "fail_count"]) >= MAX_FAILURES_BEFORE_EXCLUDE:
+                skipped_failed += 1
+                continue
 
         if is_fresh(last_dates.get(iid), now, market):
             skipped_fresh += 1
             continue
 
+        norm = normalise_market(market)
+        ticker = f"{r['symbol']}.L" if norm == "GB" else r["symbol"]
+
         start_dt = (
-            max(
+            min(
                 last_dates[iid] - timedelta(days=DAILY_BACKFILL_DAYS),
                 now - timedelta(days=MIN_BACKFILL_DAYS),
             )
             if iid in last_dates
             else now - timedelta(days=MAX_LOOKBACK_DAYS)
-        )
-
-        ticker = (
-            f"{r['symbol']}.L"
-            if normalise_market(market) == "GB"
-            else r["symbol"]
         )
 
         tasks.append((
@@ -352,6 +387,7 @@ async def run_async() -> None:
             now.strftime("%Y-%m-%d"),
         ))
 
+    print(f"Mode: {MODE}")
     print(f"✓ Skipped (fresh): {skipped_fresh:,}")
     print(f"✓ Skipped (failed ≥{MAX_FAILURES_BEFORE_EXCLUDE}): {skipped_failed:,}")
     print(f"✓ Fetching prices for: {len(tasks):,}")
@@ -365,6 +401,9 @@ async def run_async() -> None:
 
     try:
         for idx, payload in enumerate(tasks, 1):
+            iid = payload[1]
+            now_utc = pd.Timestamp.utcnow()
+
             try:
                 result = await fetch_one(loop, executor, payload)
             except YFRateLimitError:
@@ -375,19 +414,40 @@ async def run_async() -> None:
             if isinstance(result, pd.DataFrame):
                 frames.append(result)
                 success += 1
-                print(f"[{idx}/{len(tasks)}] ✔ {payload[2]} → {len(result):,} rows")
+                state = upsert_state(state, {
+                    "instrument_id": iid,
+                    "yahoo_ticker": payload[0],
+                    "yahoo_verified": True,
+                    "fail_count": 0,
+                    "last_attempt_utc": now_utc,
+                    "last_success_utc": now_utc,
+                })
             else:
                 failures += 1
-                log_failure(payload[1], payload[2], payload[3], "no_data")
-                print(f"[{idx}/{len(tasks)}] ⚠ {payload[2]} → no_data")
+                log_failure(iid, payload[2], payload[3], "no_data")
+                prev = int(state_idx.loc[iid, "fail_count"]) if iid in state_idx.index else 0
+                state = upsert_state(state, {
+                    "instrument_id": iid,
+                    "yahoo_ticker": payload[0],
+                    "yahoo_verified": False,
+                    "fail_count": prev + 1,
+                    "last_attempt_utc": now_utc,
+                    "last_success_utc": pd.NaT,
+                })
 
             if idx % CHECKPOINT_EVERY == 0:
                 checkpoint_prices(frames)
+                save_eligibility_state(state)
+
+            if idx % BURST_SIZE == 0:
+                print(f"⏸ Cooling down after {idx:,} requests")
+                await asyncio.sleep(BURST_COOLDOWN_SECONDS)
 
             eta = int((time.time() - start_time) / idx * (len(tasks) - idx))
-            print(f"    ETA≈{eta}s")
+            print(f"[{idx}/{len(tasks)}] ETA≈{eta}s")
 
         checkpoint_prices(frames)
+        save_eligibility_state(state)
 
         print(
             f"\n✓ Ingest complete — "
