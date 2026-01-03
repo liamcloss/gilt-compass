@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, timedelta, UTC, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, Tuple, Optional, Callable, cast
 import time
@@ -298,7 +298,7 @@ async def run_async() -> None:
     last_dates = load_last_price_dates()
     failure_counts = load_failure_counts()
 
-    now = pd.Timestamp(datetime.now(UTC))
+    now = pd.Timestamp(datetime.now(timezone.utc))
 
     tasks: list[PricePayload] = []
     skipped_fresh = skipped_failed = 0

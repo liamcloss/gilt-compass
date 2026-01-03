@@ -10,7 +10,7 @@ Rules:
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timezone, timedelta
 import numpy as np
 
 
@@ -144,7 +144,7 @@ def run() -> None:
         how="left",
     )
 
-    fresh_cutoff = datetime.now(UTC) - timedelta(days=MAX_PRICE_AGE_DAYS)
+    fresh_cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_PRICE_AGE_DAYS)
     is_fresh = merged["last_price_date"] >= fresh_cutoff
 
     # -----------------------------------------------------------------
@@ -172,7 +172,7 @@ def run() -> None:
     # Build queue
     # -----------------------------------------------------------------
 
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
 
     queue = triggers[
         ["instrument_id", "score", "score_prev", "score_delta", "abs_delta"]

@@ -10,7 +10,7 @@ Deterministic. Incremental. Idempotent.
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import textwrap
 
 
@@ -127,7 +127,7 @@ def run(max_per_run: int = 5) -> None:
             out_file.write_text(thesis, encoding="utf-8")
 
             queue.loc[idx, "status"] = "done"
-            queue.loc[idx, "processed_at"] = datetime.now(UTC).isoformat()
+            queue.loc[idx, "processed_at"] = datetime.now(timezone.utc).isoformat()
 
             processed += 1
             print(f"✓ Written → {out_file.name}")
@@ -135,7 +135,7 @@ def run(max_per_run: int = 5) -> None:
         except Exception as e:
             queue.loc[idx, "status"] = "failed"
             queue.loc[idx, "error"] = str(e)
-            queue.loc[idx, "processed_at"] = datetime.now(UTC).isoformat()
+            queue.loc[idx, "processed_at"] = datetime.now(timezone.utc).isoformat()
             print(f"✗ Failed for {instrument_id}: {e}")
 
     queue.to_csv(QUEUE, index=False)

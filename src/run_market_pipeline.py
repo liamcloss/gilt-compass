@@ -1,5 +1,5 @@
 """
-Run  Market Pipeline – Gilt Compass
+Run Market Pipeline – Gilt Compass
 
 Prices, scoring, attention governance, and artefact generation.
 Run daily.

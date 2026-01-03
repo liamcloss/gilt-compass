@@ -125,7 +125,7 @@ if not events_df.empty:
 # ============================================================
 
 lines = []
-today = datetime.now(UTC).date()
+today = datetime.now(timezone.utc).date()
 
 lines.append(f"DAILY MARKET ATTENTION — {today}")
 lines.append("=" * 40)

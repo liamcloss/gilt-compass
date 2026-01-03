@@ -12,7 +12,7 @@ Deterministic. Inspectable.
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timezone, timedelta
 
 
 # ---------------------------------------------------------------------
@@ -71,7 +71,7 @@ def run() -> None:
         .rename(columns={"date": "last_price_date"})
     )
 
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     fresh_cutoff = now - timedelta(days=MAX_PRICE_AGE_DAYS)
 
     eligible = latest[

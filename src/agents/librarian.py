@@ -18,7 +18,7 @@ Deterministic. Event-driven. Memory-focused.
 """
 
 from pathlib import Path
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import pandas as pd
 import textwrap
 
