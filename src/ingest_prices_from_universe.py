@@ -22,7 +22,7 @@ from filelock import FileLock, Timeout
 # MODE
 # =====================================================================
 # "BOOTSTRAP" → first full universe ingest
-# "DAILY"     → normal incremental run
+# "DAILY"     → incremental runs
 # =====================================================================
 
 MODE = "BOOTSTRAP"
@@ -74,6 +74,7 @@ MAX_LOOKBACK_DAYS = 365
 CHECKPOINT_EVERY = 25
 LOCK_TIMEOUT_SECONDS = 5
 RATE_LIMIT_SLEEP_SECONDS = 120
+SUMMARY_EVERY = 50
 
 
 # =====================================================================
@@ -98,7 +99,7 @@ def normalise_market(market: Optional[str]) -> Optional[str]:
 
 
 # =====================================================================
-# Yahoo ticker derivation (CRITICAL FIX)
+# Trading212 → Yahoo ticker derivation (fail closed)
 # =====================================================================
 
 def derive_yahoo_ticker(
@@ -106,11 +107,6 @@ def derive_yahoo_ticker(
     symbol: str,
     market: Optional[str],
 ) -> Optional[str]:
-    """
-    Convert Trading 212 identifiers to Yahoo-compatible tickers.
-    Fail closed if not confident.
-    """
-
     # Clean symbol already suitable
     if symbol.isupper() and symbol.isalpha() and 1 <= len(symbol) <= 5:
         return symbol
@@ -160,10 +156,8 @@ def suppress_stdout_stderr():
 def load_last_price_dates() -> LastDateMap:
     if not PRICES_OUT.exists():
         return {}
-
     prices = pd.read_parquet(PRICES_OUT, columns=["instrument_id", "date"])
     prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce")
-
     return cast(
         LastDateMap,
         prices.dropna()
@@ -175,14 +169,17 @@ def load_last_price_dates() -> LastDateMap:
 
 def load_eligibility_state() -> pd.DataFrame:
     if not ELIGIBILITY_OUT.exists():
-        return pd.DataFrame(columns=[
-            "instrument_id",
-            "yahoo_ticker",
-            "yahoo_verified",
-            "fail_count",
-            "last_attempt_utc",
-            "last_success_utc",
-        ])
+        # Explicit initialisation (authoritative file)
+        df = pd.DataFrame({
+            "instrument_id": pd.Series(dtype="string"),
+            "yahoo_ticker": pd.Series(dtype="string"),
+            "yahoo_verified": pd.Series(dtype="boolean"),
+            "fail_count": pd.Series(dtype="int64"),
+            "last_attempt_utc": pd.Series(dtype="datetime64[ns, UTC]"),
+            "last_success_utc": pd.Series(dtype="datetime64[ns, UTC]"),
+        })
+        df.to_parquet(ELIGIBILITY_OUT, index=False)
+        return df
     return pd.read_parquet(ELIGIBILITY_OUT)
 
 
@@ -192,25 +189,37 @@ def save_eligibility_state(state: pd.DataFrame) -> None:
 
 def upsert_state(state: pd.DataFrame, update: dict) -> pd.DataFrame:
     iid = update["instrument_id"]
-    if iid not in set(state["instrument_id"]):
-        return pd.concat([state, pd.DataFrame([update])], ignore_index=True)
-
-    idx = state.index[state["instrument_id"] == iid][0]
+    matches = state.index[state["instrument_id"] == iid]
+    if len(matches) == 0:
+        # append without concat
+        new_idx = len(state)
+        for col in state.columns:
+            state.at[new_idx, col] = update.get(col, pd.NA)
+        return state
+    idx = matches[0]
     for k, v in update.items():
-        state.at[idx, k] = v
+        if k in state.columns:
+            state.at[idx, k] = v
     return state
 
 
-def is_fresh(last_dt: Optional[pd.Timestamp], now: pd.Timestamp, market: Optional[str]) -> bool:
+def is_fresh(
+    last_dt: Optional[pd.Timestamp],
+    now: pd.Timestamp,
+    market: Optional[str],
+) -> bool:
     if last_dt is None:
         return False
     norm = normalise_market(market)
     if norm is None:
         return False
-
     cfg = MARKET_CLOSES[norm]
     now_local = now.tz_convert(cfg["tz"])
-    latest_close = now_local.date() if now_local.time() >= cfg["close_time"] else now_local.date() - timedelta(days=1)
+    latest_close = (
+        now_local.date()
+        if now_local.time() >= cfg["close_time"]
+        else now_local.date() - timedelta(days=1)
+    )
     return last_dt.date() >= latest_close
 
 
@@ -218,7 +227,12 @@ def is_fresh(last_dt: Optional[pd.Timestamp], now: pd.Timestamp, market: Optiona
 # Failure logging (audit)
 # =====================================================================
 
-def log_failure(instrument_id: str, symbol: str, market: Optional[str], reason: str) -> None:
+def log_failure(
+    instrument_id: str,
+    symbol: str,
+    market: Optional[str],
+    reason: str,
+) -> None:
     row = pd.DataFrame([{
         "ts_utc": pd.Timestamp.utcnow(),
         "instrument_id": instrument_id,
@@ -245,7 +259,13 @@ def fetch_prices_yahoo(
 ) -> Optional[pd.DataFrame]:
     try:
         with suppress_stdout_stderr():
-            df = yf.download(ticker, start=start, end=end, progress=False, threads=False)
+            df = yf.download(
+                ticker,
+                start=start,
+                end=end,
+                progress=False,
+                threads=False,
+            )
     except YFRateLimitError:
         raise
     except Exception:
@@ -280,8 +300,10 @@ def fetch_prices_yahoo(
     df["price_source"] = "yahoo"
 
     return df[
-        ["instrument_id", "symbol", "market", "price_source",
-         "date", "open", "high", "low", "close", "adj_close", "volume"]
+        [
+            "instrument_id", "symbol", "market", "price_source",
+            "date", "open", "high", "low", "close", "adj_close", "volume",
+        ]
     ]
 
 
@@ -319,6 +341,17 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 
 
 # =====================================================================
+# Per-ticker CLI status helper
+# =====================================================================
+
+def ticker_status(idx: int, total: int, symbol: str, status: str, detail: str = "") -> None:
+    msg = f"[{idx}/{total}] {symbol:<10} → {status}"
+    if detail:
+        msg += f" ({detail})"
+    print(msg)
+
+
+# =====================================================================
 # Main
 # =====================================================================
 
@@ -332,7 +365,13 @@ async def run_async() -> None:
     if "market" not in universe.columns:
         universe["market"] = None
 
-    candidates = universe[(universe["active"] == True) & (universe["price_eligible"] == True)]
+    print(f"[phase] universe loaded — {len(universe):,} rows")
+
+    candidates = universe[
+        (universe["active"] == True)
+        & (universe["price_eligible"] == True)
+    ]
+    print(f"[phase] candidates selected — {len(candidates):,}")
 
     last_dates = load_last_price_dates()
     state = load_eligibility_state()
@@ -344,7 +383,7 @@ async def run_async() -> None:
     for _, r in candidates.iterrows():
         iid = r["instrument_id"]
 
-        if iid in state_idx.index and state_idx.loc[iid, "fail_count"] >= MAX_FAILURES_BEFORE_EXCLUDE:
+        if iid in state_idx.index and int(state_idx.loc[iid, "fail_count"]) >= MAX_FAILURES_BEFORE_EXCLUDE:
             continue
 
         if is_fresh(last_dates.get(iid), now, r.get("market")):
@@ -356,35 +395,49 @@ async def run_async() -> None:
             continue
 
         start_dt = (
-            min(last_dates[iid] - timedelta(days=DAILY_BACKFILL_DAYS), now - timedelta(days=MIN_BACKFILL_DAYS))
+            min(
+                last_dates[iid] - timedelta(days=DAILY_BACKFILL_DAYS),
+                now - timedelta(days=MIN_BACKFILL_DAYS),
+            )
             if iid in last_dates
             else now - timedelta(days=MAX_LOOKBACK_DAYS)
         )
 
-        tasks.append((ticker, iid, r["symbol"], r.get("market"),
-                      start_dt.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")))
+        tasks.append((
+            ticker, iid, r["symbol"], r.get("market"),
+            start_dt.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"),
+        ))
 
-    print(f"Mode: {MODE} | Fetching {len(tasks):,} instruments")
+    total = len(tasks)
+    print(f"[phase] tasks built — {total:,}")
+    print(f"[phase] fetch loop started (mode={MODE}, workers={MAX_WORKERS})")
 
     loop = asyncio.get_running_loop()
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     frames: list[pd.DataFrame] = []
+    success = failures = rate_limits = 0
     start_time = time.time()
 
     try:
         for idx, payload in enumerate(tasks, 1):
             iid = payload[1]
+            symbol = payload[2]
             now_utc = pd.Timestamp.utcnow()
 
             try:
                 result = await fetch_one(loop, executor, payload)
             except YFRateLimitError:
+                rate_limits += 1
+                ticker_status(idx, total, symbol, "RATE_LIMIT")
+                print(f"[rate-limit] sleeping {RATE_LIMIT_SLEEP_SECONDS}s")
                 await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
                 continue
 
             if isinstance(result, pd.DataFrame):
+                success += 1
                 frames.append(result)
+                ticker_status(idx, total, symbol, "FETCHED", f"{len(result)} rows")
                 state = upsert_state(state, {
                     "instrument_id": iid,
                     "yahoo_ticker": payload[0],
@@ -394,8 +447,10 @@ async def run_async() -> None:
                     "last_success_utc": now_utc,
                 })
             else:
+                failures += 1
                 prev = int(state_idx.loc[iid, "fail_count"]) if iid in state_idx.index else 0
-                log_failure(iid, payload[2], payload[3], "no_data")
+                ticker_status(idx, total, symbol, "NO_DATA", f"fail={prev+1}")
+                log_failure(iid, symbol, payload[3], "no_data")
                 state = upsert_state(state, {
                     "instrument_id": iid,
                     "yahoo_ticker": payload[0],
@@ -410,13 +465,25 @@ async def run_async() -> None:
                 save_eligibility_state(state)
 
             if idx % BURST_SIZE == 0:
+                print(f"[cooldown] burst pause {BURST_COOLDOWN_SECONDS}s after {idx:,}")
                 await asyncio.sleep(BURST_COOLDOWN_SECONDS)
+
+            if idx % SUMMARY_EVERY == 0:
+                elapsed = int(time.time() - start_time)
+                print(
+                    f"[summary] {idx}/{total} | "
+                    f"ok={success} no_data={failures} rl={rate_limits} | "
+                    f"elapsed={elapsed}s"
+                )
 
         checkpoint_prices(frames)
         save_eligibility_state(state)
 
         elapsed = int(time.time() - start_time)
-        print(f"✓ Complete in {elapsed}s")
+        print(
+            f"[done] {success} fetched | {failures} no_data | "
+            f"{rate_limits} rate_limit | elapsed={elapsed}s"
+        )
 
     finally:
         executor.shutdown(wait=True)
