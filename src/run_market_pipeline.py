@@ -5,6 +5,7 @@ Prices, scoring, attention governance, and artefact generation.
 Run daily.
 """
 
+import src.bootstrap  # noqa: F401
 import subprocess
 import sys
 from pathlib import Path

@@ -4,7 +4,7 @@ Weekly Universe Pipeline – Gilt Compass
 Discovers and manages instrument lifecycle.
 Run weekly.
 """
-
+import src.bootstrap  # noqa: F401
 import subprocess
 import sys
 from pathlib import Path

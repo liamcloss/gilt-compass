@@ -10,7 +10,7 @@ Rules:
 """
 
 from pathlib import Path
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import pandas as pd
 
 
@@ -84,7 +84,30 @@ def validate_snapshot(df: pd.DataFrame) -> pd.DataFrame:
 
 def run() -> None:
     if not UNIVERSE_PATH.exists():
-        raise RuntimeError(f"Universe file not found: {UNIVERSE_PATH}")
+        print("ℹ Universe not found — initialising from latest snapshot")
+
+        latest_snapshot_path = max(
+            RAW_DIR.glob("trading212_raw_*.parquet"),
+            key=lambda p: p.stat().st_mtime,
+            default=None,
+        )
+
+        if latest_snapshot_path is None:
+            raise RuntimeError("No Trading 212 snapshots available to initialise universe")
+
+        df = pd.read_parquet(latest_snapshot_path)
+
+        if "instrument_id" not in df.columns:
+            df["instrument_id"] = df["ticker"]
+
+        df["active"] = True
+        df["first_seen_at"] = datetime.now(timezone.utc).isoformat()
+        df["last_seen_at"] = df["first_seen_at"]
+
+        df.to_csv(UNIVERSE_PATH, index=False)
+
+        print(f"✓ Initial universe created: {UNIVERSE_PATH.name}")
+        return
 
     snapshot_path = latest_snapshot()
 
@@ -119,7 +142,7 @@ def run() -> None:
     # Mark inactive
     # -----------------------------------------------------------------
 
-    today = datetime.now(UTC).date().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
 
     universe.loc[mask, "active"] = False
     universe.loc[mask, "inactive_on"] = today

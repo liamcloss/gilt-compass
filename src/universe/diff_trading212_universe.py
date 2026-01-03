@@ -11,7 +11,7 @@ Deterministic. Inspectable. Idempotent.
 
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------
@@ -30,10 +30,15 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Helpers
 # ---------------------------------------------------------------------
 
-def latest_two_snapshots() -> tuple[Path, Path]:
+def latest_two_snapshots() -> tuple[Path | None, Path]:
     files = sorted(RAW_DIR.glob("trading212_raw_*.parquet"))
-    if len(files) < 2:
-        raise RuntimeError("Need at least two Trading 212 snapshots to diff")
+
+    if not files:
+        raise RuntimeError("No Trading 212 snapshots found")
+
+    if len(files) == 1:
+        return None, files[0]
+
     return files[-2], files[-1]
 
 
@@ -131,17 +136,21 @@ def diff_universe(prev: pd.DataFrame, curr: pd.DataFrame) -> dict:
 
 def run() -> None:
     prev_path, curr_path = latest_two_snapshots()
-
     print("▶ Diffing Trading 212 snapshots")
-    print(f"  - Previous: {prev_path.name}")
     print(f"  - Current : {curr_path.name}")
+
+    if prev_path is None:
+        print("ℹ First snapshot detected — establishing baseline")
+        return
+
+    print(f"  - Previous: {prev_path.name}")
 
     prev = derive_instrument_id(load_snapshot(prev_path))
     curr = derive_instrument_id(load_snapshot(curr_path))
 
     diff = diff_universe(prev, curr)
 
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     # -----------------------------------------------------------------
     # Write automation-friendly artefacts

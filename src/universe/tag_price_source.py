@@ -68,7 +68,11 @@ def run() -> None:
     df = pd.read_csv(UNIVERSE)
 
     if "symbol" not in df.columns:
-        raise RuntimeError("Universe missing 'symbol' column")
+        if "ticker" in df.columns:
+            df = df.copy()
+            df["symbol"] = df["ticker"]
+        else:
+            raise RuntimeError("Universe missing 'symbol' and 'ticker' columns")
 
     print(f"▶ Tagging price sources for {len(df):,} instruments")
 
