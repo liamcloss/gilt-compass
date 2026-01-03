@@ -35,7 +35,7 @@ def main() -> None:
         # --- Artefact generation (only for active attention) ---
         "src.agents.librarian",
         "src.agents.auditor",
-        "src.agents.thesis_agent",
+        "src.agents.thesis",
     ]
 
     try:
