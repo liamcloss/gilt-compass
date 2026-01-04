@@ -21,9 +21,6 @@ from filelock import FileLock, Timeout
 # =====================================================================
 # MODE
 # =====================================================================
-# "BOOTSTRAP" → first full universe ingest
-# "DAILY"     → incremental runs
-# =====================================================================
 
 MODE = "BOOTSTRAP"
 
@@ -53,7 +50,7 @@ LOCK_FILE = OUT_DIR / ".price_ingest.lock"
 
 
 # =====================================================================
-# Config (mode dependent)
+# Config
 # =====================================================================
 
 if MODE == "BOOTSTRAP":
@@ -98,8 +95,56 @@ def normalise_market(market: Optional[str]) -> Optional[str]:
     return None
 
 
+def infer_market(
+    instrument_id: str,
+    market: Optional[str],
+    yahoo_ticker: Optional[str],
+) -> Optional[str]:
+    # 1) Explicit market
+    norm = normalise_market(market)
+    if norm:
+        return norm
+
+    # 2) instrument_id suffix
+    if instrument_id.endswith("l_EQ"):
+        return "GB"
+    if instrument_id.endswith("_US_EQ"):
+        return "US"
+    if instrument_id.endswith("_CA_EQ"):
+        return "CA"
+
+    # 3) Yahoo suffix
+    if isinstance(yahoo_ticker, str):
+        if yahoo_ticker.endswith(".L"):
+            return "GB"
+        if yahoo_ticker.endswith(".TO"):
+            return "CA"
+
+    return None
+
+
+def is_fresh(
+    last_dt: Optional[pd.Timestamp],
+    now: pd.Timestamp,
+    market: Optional[str],
+) -> bool:
+    if last_dt is None:
+        return False
+    norm = normalise_market(market)
+    if norm is None:
+        return False
+    cfg = MARKET_CLOSES[norm]
+    now_local = now.tz_convert(cfg["tz"])
+    latest_close = (
+        now_local.date()
+        if now_local.time() >= cfg["close_time"]
+        else now_local.date() - timedelta(days=1)
+    )
+    return last_dt.date() >= latest_close
+
+
 # =====================================================================
-# Trading212 → Yahoo ticker derivation (fail closed)
+# Trading212 → Yahoo ticker
 # =====================================================================
 
 def derive_yahoo_ticker(
@@ -107,23 +152,19 @@ def derive_yahoo_ticker(
     symbol: str,
     market: Optional[str],
 ) -> Optional[str]:
-    # Clean symbol already suitable
     if symbol.isupper() and symbol.isalpha() and 1 <= len(symbol) <= 5:
         return symbol
 
-    # LSE / AIM
     if instrument_id.endswith("l_EQ"):
         base = instrument_id.replace("l_EQ", "")
         if base.isalnum():
             return f"{base}.L"
 
-    # US
     if instrument_id.endswith("_US_EQ"):
         base = instrument_id.replace("_US_EQ", "")
         if base.isalnum():
             return base
 
-    # Canada
     if instrument_id.endswith("_CA_EQ"):
         base = instrument_id.replace("_CA_EQ", "")
         if base.isalnum():
@@ -133,7 +174,7 @@ def derive_yahoo_ticker(
 
 
 # =====================================================================
-# Stdout suppression (Yahoo noise)
+# Stdout suppression
 # =====================================================================
 
 @contextlib.contextmanager
@@ -169,7 +210,6 @@ def load_last_price_dates() -> LastDateMap:
 
 def load_eligibility_state() -> pd.DataFrame:
     if not ELIGIBILITY_OUT.exists():
-        # Explicit initialisation (authoritative file)
         df = pd.DataFrame({
             "instrument_id": pd.Series(dtype="string"),
             "yahoo_ticker": pd.Series(dtype="string"),
@@ -177,6 +217,7 @@ def load_eligibility_state() -> pd.DataFrame:
             "fail_count": pd.Series(dtype="int64"),
             "last_attempt_utc": pd.Series(dtype="datetime64[ns, UTC]"),
             "last_success_utc": pd.Series(dtype="datetime64[ns, UTC]"),
+            "inferred_market": pd.Series(dtype="string"),
         })
         df.to_parquet(ELIGIBILITY_OUT, index=False)
         return df
@@ -191,7 +232,6 @@ def upsert_state(state: pd.DataFrame, update: dict) -> pd.DataFrame:
     iid = update["instrument_id"]
     matches = state.index[state["instrument_id"] == iid]
     if len(matches) == 0:
-        # append without concat
         new_idx = len(state)
         for col in state.columns:
             state.at[new_idx, col] = update.get(col, pd.NA)
@@ -203,28 +243,8 @@ def upsert_state(state: pd.DataFrame, update: dict) -> pd.DataFrame:
     return state
 
 
-def is_fresh(
-    last_dt: Optional[pd.Timestamp],
-    now: pd.Timestamp,
-    market: Optional[str],
-) -> bool:
-    if last_dt is None:
-        return False
-    norm = normalise_market(market)
-    if norm is None:
-        return False
-    cfg = MARKET_CLOSES[norm]
-    now_local = now.tz_convert(cfg["tz"])
-    latest_close = (
-        now_local.date()
-        if now_local.time() >= cfg["close_time"]
-        else now_local.date() - timedelta(days=1)
-    )
-    return last_dt.date() >= latest_close
-
-
 # =====================================================================
-# Failure logging (audit)
+# Failure logging
 # =====================================================================
 
 def log_failure(
@@ -341,7 +361,7 @@ def checkpoint_prices(frames: list[pd.DataFrame]) -> None:
 
 
 # =====================================================================
-# Per-ticker CLI status helper
+# CLI status
 # =====================================================================
 
 def ticker_status(idx: int, total: int, symbol: str, status: str, detail: str = "") -> None:
@@ -386,10 +406,22 @@ async def run_async() -> None:
         if iid in state_idx.index and int(state_idx.loc[iid, "fail_count"]) >= MAX_FAILURES_BEFORE_EXCLUDE:
             continue
 
-        if is_fresh(last_dates.get(iid), now, r.get("market")):
+        ticker = derive_yahoo_ticker(iid, r["symbol"], r.get("market"))
+
+        inferred_market = infer_market(
+            instrument_id=iid,
+            market=r.get("market"),
+            yahoo_ticker=ticker,
+        )
+
+        state = upsert_state(state, {
+            "instrument_id": iid,
+            "inferred_market": inferred_market,
+        })
+
+        if is_fresh(last_dates.get(iid), now, inferred_market):
             continue
 
-        ticker = derive_yahoo_ticker(iid, r["symbol"], r.get("market"))
         if ticker is None:
             log_failure(iid, r["symbol"], r.get("market"), "no_yahoo_mapping")
             continue
@@ -404,7 +436,7 @@ async def run_async() -> None:
         )
 
         tasks.append((
-            ticker, iid, r["symbol"], r.get("market"),
+            ticker, iid, r["symbol"], inferred_market,
             start_dt.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"),
         ))
 
